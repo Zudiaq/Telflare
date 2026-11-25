@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 200" width="100%" height="200" role="img" aria-label="Telflare 3-Lane Encrypted MTProto Pipeline">
+  <defs>
+    <linearGradient id="cardBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#111318" />
+      <stop offset="100%" stop-color="#171920" />
+    </linearGradient>
+    <filter id="dotGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3" result="b" />
+      <feMerge>
+        <feMergeNode in="b" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1000" height="200" rx="18" fill="#0c0d11" stroke="#ffffff" stroke-opacity="0.08" />
+
+  <!-- Node 1: Browser -->
+  <g transform="translate(36, 36)">
+    <rect width="236" height="128" rx="14" fill="url(#cardBg)" stroke="#10B981" stroke-opacity="0.45" stroke-width="1.5" />
+    <text x="118" y="34" text-anchor="middle" font-family="'Segoe UI', sans-serif" font-size="14" font-weight="700" fill="#ecfdf5">User Browser (Local)</text>
+    <text x="118" y="60" text-anchor="middle" font-family="'Segoe UI', sans-serif" font-size="12" fill="#94a3b8">Sessions in localStorage</text>
+    <text x="118" y="82" text-anchor="middle" font-family="'Segoe UI', sans-serif" font-size="12" fill="#94a3b8">WebCrypto AES-IGE</text>
+    <rect x="44" y="96" width="148" height="20" rx="10" fill="#10B981" fill-opacity="0.18" />
+    <text x="118" y="110" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#6ee7b7">ZERO SERVER STORAGE</text>
+  </g>
+
+  <!-- Node 2: Cloudflare Worker -->
+  <g transform="translate(382, 36)">
+    <rect width="236" height="128" rx="14" fill="url(#cardBg)" stroke="#F38020" stroke-opacity="0.5" stroke-width="1.5" />
+    <text x="118" y="34" text-anchor="middle" font-family="'Segoe UI', sans-serif" font-size="14" font-weight="700" fill="#fff7ed">Cloudflare Worker</text>
+    <text x="118" y="60" text-anchor="middle" font-family="monospace" font-size="11.5" fill="#fdba74">/ws?h=pluto..flora</text>
+    <text x="118" y="82" text-anchor="middle" font-family="'Segoe UI', sans-serif" font-size="12" fill="#94a3b8">Stateless Binary Pipe</text>
+    <rect x="42" y="96" width="152" height="20" rx="10" fill="#F38020" fill-opacity="0.18" />
+    <text x="118" y="110" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#fed7aa">NO KV • NO D1 • NO LOGS</text>
+  </g>
+
+  <!-- Node 3: Telegram DCs -->
+  <g transform="translate(728, 36)">
+    <rect width="236" height="128" rx="14" fill="url(#cardBg)" stroke="#26A5E4" stroke-opacity="0.5" stroke-width="1.5" />
+    <text x="118" y="34" text-anchor="middle" font-family="'Segoe UI', sans-serif" font-size="14" font-weight="700" fill="#f0f9ff">Telegram Cloud DCs</text>
+    <text x="118" y="60" text-anchor="middle" font-family="monospace" font-size="11.5" fill="#7dd3fc">DC 1..5 + *-1 Media</text>
+    <text x="118" y="82" text-anchor="middle" font-family="'Segoe UI', sans-serif" font-size="12" fill="#94a3b8">Encrypted Channels</text>
+    <rect x="48" y="96" width="140" height="20" rx="10" fill="#26A5E4" fill-opacity="0.18" />
+    <text x="118" y="110" text-anchor="middle" font-family="monospace" font-size="10.5" fill="#bae6fd">UNLIMITED STORAGE</text>
+  </g>
+
+  <!-- 3 Animated Lanes: Browser <-> Cloudflare -->
+  <g stroke="#ffffff" stroke-opacity="0.14" stroke-width="1.5" fill="none">
+    <line x1="272" y1="74" x2="382" y2="74" />
+    <line x1="272" y1="100" x2="382" y2="100" />
+    <line x1="272" y1="126" x2="382" y2="126" />
+    <line x1="618" y1="74" x2="728" y2="74" />
+    <line x1="618" y1="100" x2="728" y2="100" />
+    <line x1="618" y1="126" x2="728" y2="126" />
+  </g>
+
+  <!-- Moving encrypted packet dots -->
+  <circle r="3.5" fill="#10B981" filter="url(#dotGlow)">
+    <animateMotion dur="1.7s" repeatCount="indefinite" path="M 272 74 L 382 74" />
+  </circle>
+  <circle r="3.5" fill="#dc2638" filter="url(#dotGlow)">
+    <animateMotion dur="1.4s" repeatCount="indefinite" path="M 382 100 L 272 100" />
+  </circle>
+  <circle r="3.5" fill="#10B981" filter="url(#dotGlow)">
+    <animateMotion dur="2.1s" repeatCount="indefinite" path="M 272 126 L 382 126" />
+  </circle>
+
+  <circle r="3.5" fill="#F38020" filter="url(#dotGlow)">
+    <animateMotion dur="1.7s" repeatCount="indefinite" path="M 618 74 L 728 74" />
+  </circle>
+  <circle r="3.5" fill="#26A5E4" filter="url(#dotGlow)">
+    <animateMotion dur="1.4s" repeatCount="indefinite" path="M 728 100 L 618 100" />
+  </circle>
+  <circle r="3.5" fill="#F38020" filter="url(#dotGlow)">
+    <animateMotion dur="2.1s" repeatCount="indefinite" path="M 618 126 L 728 126" />
+  </circle>
+
+  <text x="327" y="58" text-anchor="middle" font-family="monospace" font-size="10" fill="#94a3b8">WSS Edge Relay</text>
+  <text x="673" y="58" text-anchor="middle" font-family="monospace" font-size="10" fill="#94a3b8">AES-IGE Cipher</text>
+</svg>

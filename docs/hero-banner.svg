@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 280" width="100%" height="280" role="img" aria-label="Telflare — Unlimited Telegram Cloud Drive on Cloudflare Workers">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b0c0f" />
+      <stop offset="52%" stop-color="#13151b" />
+      <stop offset="100%" stop-color="#170d10" />
+    </linearGradient>
+    <radialGradient id="crimsonGlow" cx="50%" cy="45%" r="48%">
+      <stop offset="0%" stop-color="#b91c2b" stop-opacity="0.34" />
+      <stop offset="55%" stop-color="#9A2227" stop-opacity="0.10" />
+      <stop offset="100%" stop-color="#131314" stop-opacity="0" />
+    </radialGradient>
+    <radialGradient id="cfGlow" cx="85%" cy="22%" r="32%">
+      <stop offset="0%" stop-color="#F38020" stop-opacity="0.22" />
+      <stop offset="100%" stop-color="#F38020" stop-opacity="0" />
+    </radialGradient>
+    <radialGradient id="tgGlow" cx="15%" cy="78%" r="32%">
+      <stop offset="0%" stop-color="#26A5E4" stop-opacity="0.22" />
+      <stop offset="100%" stop-color="#26A5E4" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="beam1" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#26A5E4" stop-opacity="0" />
+      <stop offset="45%" stop-color="#26A5E4" stop-opacity="0.7" />
+      <stop offset="55%" stop-color="#b91c2b" stop-opacity="0.9" />
+      <stop offset="100%" stop-color="#F38020" stop-opacity="0" />
+    </linearGradient>
+    <linearGradient id="beam2" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#F38020" stop-opacity="0" />
+      <stop offset="50%" stop-color="#b91c2b" stop-opacity="0.85" />
+      <stop offset="100%" stop-color="#26A5E4" stop-opacity="0" />
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#ffffff" stroke-opacity="0.035" stroke-width="1" />
+    </pattern>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="280" rx="22" fill="url(#bg)" />
+  <rect width="1200" height="280" rx="22" fill="url(#grid)" />
+  <rect width="1200" height="280" rx="22" fill="url(#crimsonGlow)">
+    <animate attributeName="opacity" values="0.75;1;0.75" dur="5.5s" repeatCount="indefinite" />
+  </rect>
+  <rect width="1200" height="280" rx="22" fill="url(#cfGlow)" />
+  <rect width="1200" height="280" rx="22" fill="url(#tgGlow)" />
+
+  <!-- Subtle 3-lane animated MTProto light rails -->
+  <g opacity="0.55">
+    <path d="M 0 64 Q 300 32 600 64 T 1200 64" fill="none" stroke="url(#beam1)" stroke-width="1.4" stroke-dasharray="14 10">
+      <animate attributeName="stroke-dashoffset" from="0" to="-96" dur="3.6s" repeatCount="indefinite" />
+    </path>
+    <path d="M 0 218 Q 300 248 600 218 T 1200 218" fill="none" stroke="url(#beam2)" stroke-width="1.4" stroke-dasharray="18 12">
+      <animate attributeName="stroke-dashoffset" from="0" to="120" dur="4.2s" repeatCount="indefinite" />
+    </path>
+  </g>
+
+  <!-- Animated orbiting data packets -->
+  <circle r="3.5" fill="#26A5E4" filter="url(#glow)">
+    <animateMotion dur="5s" repeatCount="indefinite" path="M 0 64 Q 300 32 600 64 T 1200 64" />
+  </circle>
+  <circle r="3.5" fill="#F38020" filter="url(#glow)">
+    <animateMotion dur="6s" repeatCount="indefinite" path="M 1200 218 Q 900 248 600 218 T 0 218" />
+  </circle>
+
+  <!-- Centered Wordmark: Telflare -->
+  <g transform="translate(600, 128)" text-anchor="middle">
+    <text font-family="'Arial Rounded MT Bold', 'Segoe UI', system-ui, sans-serif" font-size="68" font-weight="800" letter-spacing="-2.2">
+      <tspan fill="#94a3b8">Tel</tspan><tspan fill="#dc2638" filter="url(#glow)">f</tspan><tspan fill="#e2e8f0">lare</tspan>
+    </text>
+  </g>
+
+  <!-- Clean Spaced Tagline -->
+  <text x="600" y="176" text-anchor="middle" font-family="'Segoe UI', system-ui, sans-serif" font-size="18" font-weight="500" fill="#cbd5e1" letter-spacing="0.4">
+    Unlimited Telegram Cloud Drive on Cloudflare Workers
+  </text>
+
+  <!-- Sleek Feature Pills -->
+  <g transform="translate(600, 218)" text-anchor="middle" font-family="'Segoe UI', system-ui, sans-serif" font-size="12.5" font-weight="600">
+    <rect x="-330" y="-14" width="150" height="28" rx="14" fill="#ffffff" fill-opacity="0.06" stroke="#ffffff" stroke-opacity="0.12" />
+    <text x="-255" y="4" fill="#e2e8f0">3-Lane MTProto</text>
+
+    <rect x="-165" y="-14" width="155" height="28" rx="14" fill="#b91c2b" fill-opacity="0.22" stroke="#dc2638" stroke-opacity="0.45" />
+    <text x="-87.5" y="4" fill="#fecdd3">100% Client-Side</text>
+
+    <rect x="5" y="-14" width="155" height="28" rx="14" fill="#F38020" fill-opacity="0.16" stroke="#F38020" stroke-opacity="0.42" />
+    <text x="82.5" y="4" fill="#fed7aa">Edge WSS Relay</text>
+
+    <rect x="175" y="-14" width="155" height="28" rx="14" fill="#26A5E4" fill-opacity="0.16" stroke="#26A5E4" stroke-opacity="0.42" />
+    <text x="252.5" y="4" fill="#bae6fd">Adaptive Streaming</text>
+  </g>
+
+  <rect x="1" y="1" width="1198" height="278" rx="21" fill="none" stroke="#ffffff" stroke-opacity="0.09" stroke-width="1.5" />
+</svg>

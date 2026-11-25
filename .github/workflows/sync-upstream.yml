@@ -1,0 +1,29 @@
+name: Sync Upstream Updates (Auto-Deploy)
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.repository != 'Zudiaq/Telflare'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Sync Latest Changes from Zudiaq/Telflare
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Zudiaq/Telflare.git
+          git fetch upstream main
+          git reset --hard upstream/main
+          git push origin main --force-with-lease

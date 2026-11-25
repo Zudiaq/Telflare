@@ -1,0 +1,25 @@
+{
+  "tasks": {
+    "start": "deno run --allow-net --allow-read main.ts",
+    "build": "npm run build"
+  },
+  "deploy": {
+    "project": "zud-cloud",
+    "runtime": {
+      "type": "dynamic",
+      "entrypoint": "main.ts"
+    },
+    "entrypoint": "main.ts",
+    "include": [
+      "dist",
+      "assets",
+      "index.html",
+      "sw.js",
+      "cloud.png",
+      "cloud.svg",
+      "main.ts",
+      "server.ts",
+      "deno.json"
+    ]
+  }
+}
