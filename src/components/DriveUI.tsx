@@ -2492,6 +2492,7 @@ export const DriveUI: React.FC = () => {
   const [visibleFolderCount, setVisibleFolderCount] = useState<number>(FOLDER_RENDER_STEP);
   const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
   const loadMoreFoldersSentinelRef = useRef<HTMLDivElement | null>(null);
+  const mainScrollRef = useRef<HTMLElement | null>(null);
   const lastVisibilitySyncRef = useRef<number>(0);
   const [pathStack, setPathStack] = useState<VirtualFolder[]>([]);
   const [loading, setLoading] = useState(false);
@@ -3352,27 +3353,49 @@ export const DriveUI: React.FC = () => {
 
   const goToFolder = (result: any) => {
     const folder = result.type === 'folder' ? result.item : result.path[result.path.length - 1];
-    
+
     const newStack = [...result.path];
     if (result.type === 'folder') {
       newStack.push(result.item);
-    } else if (folder && folder.id !== 'root') {
+    } else if (folder && folder.id !== 'root' && newStack[newStack.length - 1]?.id !== folder.id) {
       newStack.push(folder);
     }
-    
+
     if (folder) {
-        setCurrentFolder(folder);
-        setPathStack(newStack);
+      setCurrentFolder(folder);
+      setPathStack(newStack);
     }
     closeSearchModal();
     setContextMenu(null);
     setSearchQuery('');
-    
+
     if (result.type === 'file') {
       setHighlightFileId(result.item.id);
       window.location.hash = `#/folder/${encodeURIComponent(folder ? folder.id : 'root')}`;
     } else {
       window.location.hash = `#/folder/${encodeURIComponent(folder ? folder.id : 'root')}`;
+    }
+
+    // Trigger on-demand lazy subfolder/channel sync when jumping from Search Results!
+    if (folder && client) {
+      const rootFolder = pathStackRef.current[0] || newStack[0];
+      const chanId = String(folder.id).split('/')[0];
+      const targetChan = rootFolder?.folders[chanId] ||
+        Object.values(rootFolder?.folders || {}).find(
+          f => String(f.id) === String(folder.channelId) || String(f.channelId) === String(folder.channelId)
+        );
+      const isEmptyNow = folder.files.length === 0 && Object.keys(folder.folders).length === 0;
+      if (folder.folderId && targetChan && folder !== targetChan && (targetChan.isLazyChannel || targetChan.historyComplete === false || isEmptyNow)) {
+        if (isEmptyNow) setIsSubfolderLoading(true);
+        void syncSubfolderOnDemand(client, targetChan, folder.folderId, filesMapRef.current, () => {
+          syncFolderStack();
+        }).finally(() => setIsSubfolderLoading(false));
+      } else if (targetChan && (targetChan.isLoaded === false || (isEmptyNow && (targetChan.serverTotalCount || 0) > 0))) {
+        if (isEmptyNow) setIsSubfolderLoading(true);
+        void syncChannelFiles(client, targetChan, filesMapRef.current, () => {
+          syncFolderStack();
+        }, { refreshDirectories: isEmptyNow }).finally(() => setIsSubfolderLoading(false));
+      }
     }
   };
 
@@ -3398,11 +3421,19 @@ export const DriveUI: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, activeAccountId]);
 
-  // Reset windowed file & folder counts when switching folders, sort, or view mode (keeps 124k+ folders 60fps!)
+  // Reset windowed file & folder counts and scroll cleanly to TOP when switching folders
   useEffect(() => {
     setVisibleFileCount(FILE_RENDER_STEP);
     setVisibleFolderCount(FOLDER_RENDER_STEP);
-  }, [currentFolder?.id, sortMode, sortOrder, viewMode]);
+    if (!highlightFileId) {
+      if (mainScrollRef.current) {
+        mainScrollRef.current.scrollTop = 0;
+      }
+      requestAnimationFrame(() => {
+        if (mainScrollRef.current) mainScrollRef.current.scrollTop = 0;
+      });
+    }
+  }, [currentFolder?.id, sortMode, sortOrder, viewMode, highlightFileId]);
 
   // Progressive infinite scroll observer: appends +120 file cards seamlessly as user scrolls
   useEffect(() => {
@@ -4993,8 +5024,44 @@ export const DriveUI: React.FC = () => {
       );
     }
 
+    // If navigating from a virtual search results view ("search:..."), reconstruct the REAL folder stack
+    // from root -> channel -> ... -> folder so syncFolderStack() NEVER bounces back to search results!
+    const buildRealStackForFolder = (): VirtualFolder[] => {
+      if (!rootFolder) return [folder];
+      const parts = String(folder.id || '').split('/').filter(Boolean);
+      if (parts.length === 0) return [rootFolder, folder];
+      const stack: VirtualFolder[] = [rootFolder];
+      let cursor: VirtualFolder | undefined = chanFolder || rootFolder.folders[parts[0]];
+      if (cursor) {
+        stack.push(cursor);
+        for (let i = 1; i < parts.length; i++) {
+          const folderChildren: Record<string, VirtualFolder> = cursor.folders || {};
+          const next: VirtualFolder | undefined = folderChildren[parts[i]] ||
+            Object.values(folderChildren).find(sub => sub.name === parts[i] || sub.id === parts.slice(0, i + 1).join('/'));
+          if (next) {
+            cursor = next;
+            stack.push(next);
+          } else {
+            break;
+          }
+        }
+      }
+      if (stack[stack.length - 1]?.id !== folder.id) {
+        stack.push(folder);
+      }
+      return stack;
+    };
+
+    const isFromSearchView = pathStackRef.current.some(p => p.id?.startsWith('search:'));
     setCurrentFolder(folder);
-    setPathStack(prev => [...prev, folder]);
+    if (isFromSearchView) {
+      setPathStack(buildRealStackForFolder());
+    } else {
+      setPathStack(prev => [...prev, folder]);
+    }
+    if (mainScrollRef.current) {
+      mainScrollRef.current.scrollTop = 0;
+    }
     window.location.hash = `#/folder/${encodeURIComponent(folder.id)}`;
 
     const targetToSync = chanFolder || (folder.channelId ? folder : null);
@@ -5148,10 +5215,31 @@ export const DriveUI: React.FC = () => {
       totalBytes += (file.size || 0);
     }
 
+    // Include serverTotalCount for massive/lazy channels whose 124k+ items are loaded on demand
+    let unhydratedServerItems = 0;
+    if (root && root.folders) {
+      for (const ch of Object.values(root.folders)) {
+        const srvTotal = ch.serverTotalCount || 0;
+        if (srvTotal <= 0) continue;
+        let chLoaded = 0;
+        const st: VirtualFolder[] = [ch];
+        while (st.length > 0) {
+          const node = st.pop()!;
+          chLoaded += (node.files || []).length;
+          if (node.folders) {
+            for (const sub of Object.values(node.folders)) st.push(sub);
+          }
+        }
+        if (srvTotal > chLoaded) {
+          unhydratedServerItems += (srvTotal - chLoaded);
+        }
+      }
+    }
+
     return {
       bytes: totalBytes,
       formatted: formatSize(totalBytes),
-      fileCount: uniqueFiles.size,
+      fileCount: uniqueFiles.size + unhydratedServerItems,
     };
   }, [pathStack, currentFolder, isRefreshing]);
 
@@ -6146,7 +6234,7 @@ export const DriveUI: React.FC = () => {
             {/* ZUD Vault Cyber Storage HUD - Desktop */}
             <div 
               className="hidden md:flex items-center gap-2.5 px-3 py-1.5 rounded-xl bg-gradient-to-r from-[#18181b]/90 via-[#231719]/80 to-[#18181b]/90 hover:from-[#20181a] hover:to-[#28171b] border border-white/10 hover:border-red-500/35 shadow-[inset_0_1px_1px_rgba(255,255,255,0.06),0_4px_16px_rgba(0,0,0,0.5)] backdrop-blur-xl transition-all duration-300 group cursor-default select-none relative overflow-hidden"
-              title={`ZUD Cloud Vault: ${storageStats.formatted} across ${storageStats.fileCount} files`}
+              title={`ZUD Cloud Vault: ${storageStats.formatted} across ${storageStats.fileCount.toLocaleString()} files`}
             >
               {/* Micro Crimson Laser Accent Border */}
               <div className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-4/5 bg-gradient-to-b from-[#9A2227] via-rose-500 to-transparent rounded-r-full opacity-90 group-hover:opacity-100 transition-opacity" />
@@ -6166,7 +6254,7 @@ export const DriveUI: React.FC = () => {
               <div className="flex flex-col justify-center min-w-[70px]">
                 <div className="flex items-center gap-1.5">
                   <span className="text-[9px] font-black uppercase tracking-widest text-zinc-400">VAULT</span>
-                  <span className="text-[9px] font-mono text-zinc-400">• {storageStats.fileCount}</span>
+                  <span className="text-[9px] font-mono text-zinc-400">• {storageStats.fileCount.toLocaleString()}</span>
                 </div>
                 <span className="text-xs font-mono font-bold tracking-tight bg-gradient-to-r from-white via-zinc-100 to-rose-200 bg-clip-text text-transparent group-hover:to-white transition-all">
                   {storageStats.formatted}
@@ -6375,7 +6463,7 @@ export const DriveUI: React.FC = () => {
       {/* Music Player (Minimal bar below header / breadcrumbs) */}
       <MusicPlayer />
 
-      <main className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 sm:p-6 pb-[calc(4.75rem+env(safe-area-inset-bottom,0px))] md:pb-6 pl-[max(1rem,env(safe-area-inset-left,0px))] pr-[max(1rem,env(safe-area-inset-right,0px))] bg-white dark:bg-[#131314] select-none touch-no-select">
+      <main ref={mainScrollRef} className="min-h-0 flex-1 overflow-y-auto overscroll-contain [overflow-anchor:none] p-4 sm:p-6 pb-[calc(4.75rem+env(safe-area-inset-bottom,0px))] md:pb-6 pl-[max(1rem,env(safe-area-inset-left,0px))] pr-[max(1rem,env(safe-area-inset-right,0px))] bg-white dark:bg-[#131314] select-none touch-no-select">
         {loading ? (
           <div className="flex flex-col items-center justify-center h-64 text-gray-500 gap-4">
             <div className="app-loader">
@@ -8025,7 +8113,7 @@ export const DriveUI: React.FC = () => {
                   </span>
                 </div>
                 <div className="flex items-center gap-1 text-[10px] font-mono text-zinc-400">
-                  <span className="text-zinc-300 font-semibold">{storageStats.fileCount}</span>
+                  <span className="text-zinc-300 font-semibold">{storageStats.fileCount.toLocaleString()}</span>
                   <span className="text-zinc-500">{storageStats.fileCount === 1 ? 'file' : 'files'}</span>
                 </div>
               </div>
