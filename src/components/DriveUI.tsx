@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useTelegram } from '../context/TelegramContext';
 import type { StoredTelegramAccount } from '../lib/telegram';
 import { Login } from './Login';
-import { syncChannelFiles, clearChannelCache, parseMetadata, parseDocSize, hydrateChannelFromCache, loadChannelCache, getMimeType, fetchChannelTopInfo, syncSubfolderOnDemand, isChannelBackfilling } from '../lib/vfs';
+import { syncChannelFiles, clearChannelCache, parseMetadata, parseDocSize, hydrateChannelFromCache, loadChannelCache, getMimeType, fetchChannelTopInfo, syncSubfolderOnDemand, isChannelBackfilling, searchChannelOnDemand } from '../lib/vfs';
 import type { VirtualFolder, VirtualFile } from '../lib/vfs';
 import { Folder, File, Download, Smartphone, UploadCloud, ChevronRight, ChevronDown, LayoutGrid, List, LayoutDashboard, Loader2, X, Settings, LogOut, Play, Pause, Volume2, VolumeX, Maximize, Search, ArrowLeft, ArrowRight, Rewind, FastForward, Copy, Scissors, Trash2, Check, MoreVertical, ClipboardPaste, Edit2, FileAudio, CheckCircle2, Subtitles, Upload, Clock, Layers, AlertCircle, ShieldAlert, AlertTriangle, Sparkles, ListMusic, RotateCw, Database, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react';
 import { buildTelegramCaption } from '../lib/caption';
@@ -3129,55 +3129,98 @@ export const DriveUI: React.FC = () => {
       setSearchResults([]);
       return;
     }
-    
-    const results: {type: 'file'|'folder', item: any, path: VirtualFolder[]}[] = [];
-    const resultKeys = new Set<string>();
-    const queryParts = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
-    const isMatch = (name: string) => {
-      const n = name.toLowerCase().replace(/_/g, ' '); // Replace underscores with spaces for matching
-      return queryParts.every(part => n.includes(part));
-    };
-    
-    const addResult = (type: 'file'|'folder', item: any, path: VirtualFolder[]) => {
-      const key = `${type}:${String(item.id)}`;
-      if (resultKeys.has(key)) return;
-      resultKeys.add(key);
-      results.push({ type, item, path });
+
+    const MAX_SEARCH_RESULTS = 250;
+    const runLocalSearch = (root: VirtualFolder) => {
+      const results: { type: 'file' | 'folder'; item: any; path: VirtualFolder[] }[] = [];
+      const resultKeys = new Set<string>();
+      const queryParts = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
+      const isMatch = (name: string) => {
+        const n = name.toLowerCase().replace(/_/g, ' ');
+        return queryParts.every(part => n.includes(part));
+      };
+
+      const addResult = (type: 'file' | 'folder', item: any, path: VirtualFolder[]) => {
+        if (results.length >= MAX_SEARCH_RESULTS) return;
+        const key = `${type}:${String(item.id)}`;
+        if (resultKeys.has(key)) return;
+        resultKeys.add(key);
+        results.push({ type, item, path });
+      };
+
+      const collectFolderContents = (folder: VirtualFolder, currentPath: VirtualFolder[]) => {
+        addResult('folder', folder, currentPath);
+        if (results.length >= MAX_SEARCH_RESULTS) return;
+        for (const file of folder.files) {
+          addResult('file', file, [...currentPath, folder]);
+          if (results.length >= MAX_SEARCH_RESULTS) return;
+        }
+        for (const childId in folder.folders) {
+          if (results.length >= MAX_SEARCH_RESULTS) return;
+          const child = folder.folders[childId];
+          if (child.isLoaded === false) continue;
+          collectFolderContents(child, [...currentPath, folder]);
+        }
+      };
+
+      const searchFolder = (folder: VirtualFolder, currentPath: VirtualFolder[]) => {
+        if (results.length >= MAX_SEARCH_RESULTS) return;
+        if (folder.id !== 'root' && isMatch(folder.name)) {
+          collectFolderContents(folder, currentPath);
+        }
+        for (const file of folder.files) {
+          if (results.length >= MAX_SEARCH_RESULTS) return;
+          if (isMatch(file.name)) {
+            addResult('file', file, [...currentPath, folder]);
+          }
+        }
+        for (const childId in folder.folders) {
+          if (results.length >= MAX_SEARCH_RESULTS) return;
+          const child = folder.folders[childId];
+          if (child.isLoaded === false) continue;
+          searchFolder(child, [...currentPath, folder]);
+        }
+      };
+
+      searchFolder(root, []);
+      setSearchResults(results);
     };
 
-    const collectFolderContents = (folder: VirtualFolder, currentPath: VirtualFolder[]) => {
-      addResult('folder', folder, currentPath);
-      for (const file of folder.files) {
-        addResult('file', file, [...currentPath, folder]);
-      }
-      for (const childId in folder.folders) {
-        const child = folder.folders[childId];
-        if (child.isLoaded === false) continue;
-        collectFolderContents(child, [...currentPath, folder]);
-      }
-    };
+    runLocalSearch(pathStack[0]);
 
-    const searchFolder = (folder: VirtualFolder, currentPath: VirtualFolder[]) => {
-       if (folder.id !== 'root' && isMatch(folder.name)) {
-         collectFolderContents(folder, currentPath);
-       }
-       for (const file of folder.files) {
-         if (isMatch(file.name)) {
-           addResult('file', file, [...currentPath, folder]);
-         }
-       }
-       for (const childId in folder.folders) {
-         const child = folder.folders[childId];
-         // Only skip explicitly unloaded channel folders
-         if (child.isLoaded === false) continue;
-         searchFolder(child, [...currentPath, folder]);
-       }
+    // Hybrid Live Server Search: for massive channels (e.g. 124,000 items) that haven't finished full backfill,
+    // query Telegram's server-side search index directly in ~150ms without needing to sync all 124k items!
+    const cleanQ = searchQuery.trim();
+    if (!client || cleanQ.length < 2) return;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      const root = pathStackRef.current[0];
+      if (!root || cancelled) return;
+      const partialChannels = Object.values(root.folders).filter(
+        (ch) => ch.historyComplete === false || ((ch.serverTotalCount || 0) > (ch.files.length + 100))
+      );
+      if (partialChannels.length === 0) return;
+
+      let anyFound = false;
+      await Promise.all(
+        partialChannels.slice(0, 4).map(async (ch) => {
+          const count = await searchChannelOnDemand(client, ch, cleanQ, filesMapRef.current, () => {
+            if (!cancelled) syncFolderStack();
+          });
+          if (count > 0) anyFound = true;
+        })
+      );
+      if (anyFound && !cancelled && pathStackRef.current[0]) {
+        runLocalSearch(pathStackRef.current[0]);
+      }
+    }, 320);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
     };
-    
-    searchFolder(pathStack[0], []);
-    setSearchResults(results);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchQuery, pathStack]); // removed filesMap dependency
+  }, [searchQuery, pathStack]);
 
   useEffect(() => {
     const closeMenu = () => setContextMenu(null);

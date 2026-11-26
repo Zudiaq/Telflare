@@ -54,6 +54,45 @@ const searchChannelMessages = async (
   return out;
 };
 
+export const searchChannelOnDemand = async (
+  client: TelegramClient,
+  channelFolder: VirtualFolder,
+  query: string,
+  globalFilesMap: { [path: string]: VirtualFile },
+  onUpdate: () => void,
+): Promise<number> => {
+  const cleanQ = query.trim();
+  if (!client || !channelFolder?.channelId || cleanQ.length < 2) return 0;
+  const channelIdStr = typeof channelFolder.channelId === 'object' && channelFolder.channelId.value !== undefined
+    ? String(channelFolder.channelId.value)
+    : String(channelFolder.channelId);
+  if (!channelIdStr || channelIdStr === 'me' || channelIdStr === 'root') return 0;
+
+  try {
+    const peerEntity = channelFolder.accessHash
+      ? { id: channelFolder.channelId, accessHash: channelFolder.accessHash }
+      : (channelFolder.channelId || channelFolder.id);
+    const peer = await resolveTelegramEntity(client, peerEntity);
+    const found = await searchChannelMessages(client, peer, cleanQ, 2);
+    if (found.length === 0) return 0;
+
+    let cached = await loadChannelCache(channelIdStr);
+    if (!cached) {
+      cached = { channelId: channelIdStr, lastMessageId: 0, minSyncedId: 0, historyComplete: false, files: [], foldersList: [] };
+    }
+    const changed = ingestBatchIntoCache(channelIdStr, channelFolder.id, cached, found);
+    if (changed) {
+      hydrateChannelFromCache(channelFolder, cached, globalFilesMap);
+      await saveChannelCache(channelIdStr, cached);
+      onUpdate();
+    }
+    return found.length;
+  } catch (e) {
+    console.warn(`Live server search failed for channel ${channelIdStr}:`, e);
+    return 0;
+  }
+};
+
 export const syncSubfolderOnDemand = async (
   client: TelegramClient,
   channelFolder: VirtualFolder,
@@ -993,8 +1032,11 @@ export const syncChannelFiles = async (
     channelFolder.folders = {};
   }
 
-  if (cached.historyComplete === undefined && cached.lastMessageId > 0) {
+  const localTotal = cached.files.length + (cached.foldersList?.length || 0);
+  if (cached.historyComplete === undefined && cached.lastMessageId > 0 && localTotal > 0) {
     cached.historyComplete = true;
+  } else if (localTotal === 0) {
+    cached.historyComplete = false;
   }
 
   const byIdMap = new Map<string, VirtualFile>();
@@ -1027,6 +1069,13 @@ export const syncChannelFiles = async (
     if (topInfo.totalCount > 0) {
       cached.serverTotalCount = topInfo.totalCount;
       channelFolder.serverTotalCount = topInfo.totalCount;
+      // Self-heal poisoned legacy empty/severely-incomplete caches automatically!
+      const localCount = cached.files.length + (cached.foldersList?.length || 0);
+      if (localCount === 0 || (topInfo.totalCount > 500 && localCount < 100)) {
+        cached.historyComplete = false;
+        cached.minSyncedId = 0;
+        channelFolder.historyComplete = false;
+      }
     }
 
     // Phase A: Delta Head Sync (ONLY messages newer than cached.lastMessageId!)
@@ -1057,7 +1106,10 @@ export const syncChannelFiles = async (
       // so subfolders created at the beginning of a 124,000-message channel appear IMMEDIATELY!
       if ((cached.serverTotalCount || 0) > 300 || (cached.foldersList?.length || 0) === 0) {
         try {
-          const dirMsgs = await searchChannelMessages(client, peer, 'Directory', 40);
+          let dirMsgs = await searchChannelMessages(client, peer, 'Directory', 40);
+          if (dirMsgs.length === 0) {
+            dirMsgs = await searchChannelMessages(client, peer, 'dir', 20);
+          }
           if (dirMsgs.length > 0 && ingestMessagesBatch(dirMsgs)) {
             await flushToUiAndCache();
           }
