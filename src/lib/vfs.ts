@@ -14,6 +14,85 @@ const INITIAL_BURST_PAGES = 3;
 
 const activeBackfillJobs = new Set<string>();
 
+export const isChannelBackfilling = (channelId: string): boolean => activeBackfillJobs.has(String(channelId));
+
+const searchChannelMessages = async (
+  client: TelegramClient,
+  peer: any,
+  query: string,
+  maxPages = 25,
+): Promise<any[]> => {
+  const out: any[] = [];
+  let offsetId = 0;
+  for (let p = 0; p < maxPages; p++) {
+    const res: any = await gate(1, async () => {
+      await ensureTelegramConnected(client);
+      return client.invoke(
+        new Api.messages.Search({
+          peer,
+          q: query,
+          filter: new Api.InputMessagesFilterEmpty(),
+          minDate: 0,
+          maxDate: 0,
+          offsetId,
+          addOffset: 0,
+          limit: HISTORY_PAGE,
+          maxId: 0,
+          minId: 0,
+          hash: 0 as any,
+        }),
+      );
+    });
+    const msgs: any[] = Array.isArray(res?.messages) ? res.messages : [];
+    if (msgs.length === 0) break;
+    for (const m of msgs) {
+      if (m && typeof m.id === 'number') out.push(m);
+    }
+    if (msgs.length < HISTORY_PAGE) break;
+    offsetId = msgs[msgs.length - 1].id;
+  }
+  return out;
+};
+
+export const syncSubfolderOnDemand = async (
+  client: TelegramClient,
+  channelFolder: VirtualFolder,
+  targetFolderId: string,
+  globalFilesMap: { [path: string]: VirtualFile },
+  onUpdate: () => void,
+): Promise<number> => {
+  if (!client || !channelFolder?.channelId || !targetFolderId || targetFolderId === 'root') return 0;
+  const channelIdStr = typeof channelFolder.channelId === 'object' && channelFolder.channelId.value !== undefined
+    ? String(channelFolder.channelId.value)
+    : String(channelFolder.channelId);
+  if (!channelIdStr || channelIdStr === 'me' || channelIdStr === 'root') return 0;
+
+  try {
+    const peerEntity = channelFolder.accessHash
+      ? { id: channelFolder.channelId, accessHash: channelFolder.accessHash }
+      : (channelFolder.channelId || channelFolder.id);
+    const peer = await resolveTelegramEntity(client, peerEntity);
+    // Telegram server-side search finds all files & child folders referencing this folderId in ~0.3s!
+    const found = await searchChannelMessages(client, peer, targetFolderId, 30);
+    if (found.length === 0) return 0;
+
+    let cached = await loadChannelCache(channelIdStr);
+    if (!cached) {
+      cached = { channelId: channelIdStr, lastMessageId: 0, minSyncedId: 0, historyComplete: false, files: [], foldersList: [] };
+    }
+    const changed = ingestBatchIntoCache(channelIdStr, channelFolder.id, cached, found);
+    if (changed) {
+      hydrateChannelFromCache(channelFolder, cached, globalFilesMap);
+      await saveChannelCache(channelIdStr, cached);
+      onUpdate();
+    }
+    return found.length;
+  } catch (e) {
+    console.warn(`On-demand subfolder search failed for ${targetFolderId}:`, e);
+    return 0;
+  }
+};
+
 const fetchSingleHistoryPage = async (
   client: TelegramClient,
   peer: any,
@@ -104,6 +183,7 @@ export interface VirtualFile {
   date?: number;
   performer?: string;
   title?: string;
+  pId?: string;
   isUncaptioned?: boolean;
   isUnindexed?: boolean;
 }
@@ -530,10 +610,21 @@ export const hydrateChannelFromCache = (
     }
   }
 
-  // 2. Insert cached files into tree in O(N) using WeakMap sets (handles 124,000+ files in <25ms!)
+  // 2. Re-resolve any files whose pId was previously unresolved before their parent folder arrived,
+  // then insert cached files into tree in O(N) using WeakMap sets!
   const seenByFolder = new WeakMap<VirtualFolder, Set<string>>();
   if (cached.files) {
     for (const file of cached.files) {
+      if (file.pId && file.pId !== 'root') {
+        const resolved = resolveFolderPath(file.pId, cached.foldersList);
+        if (resolved !== null && resolved !== '') {
+          const nextPath = `${resolved}/${file.name}`;
+          if (file.path !== nextPath) {
+            file.path = nextPath;
+            file.id = `${channelFolder.id}/${nextPath}`;
+          }
+        }
+      }
       if (globalFilesMap) {
         globalFilesMap[file.id] = file;
         globalFilesMap[file.path] = file;
@@ -571,6 +662,272 @@ const dedupeCachedFiles = (files: VirtualFile[]): VirtualFile[] => {
     existing.height = file.height || existing.height;
   }
   return Array.from(byId.values());
+};
+
+const ingestBatchIntoCache = (
+  channelIdStr: string,
+  channelFolderId: string,
+  cached: CachedChannel,
+  batch: any[],
+  externalMaps?: { byIdMap: Map<string, VirtualFile>; byMsgIdMap: Map<number, VirtualFile> },
+): boolean => {
+  if (!batch || batch.length === 0) return false;
+  const sorted = [...batch].filter(m => m && typeof m.id === 'number').sort((a, b) => a.id - b.id);
+  if (sorted.length === 0) return false;
+
+  if (cached.files.length < 400) {
+    putMessages(channelIdStr, sorted.slice(-200) as any[]);
+  }
+
+  let byIdMap = externalMaps?.byIdMap;
+  let byMsgIdMap = externalMaps?.byMsgIdMap;
+  if (!byIdMap || !byMsgIdMap) {
+    byIdMap = new Map<string, VirtualFile>();
+    byMsgIdMap = new Map<number, VirtualFile>();
+    for (const f of cached.files) {
+      byIdMap.set(f.id, f);
+      for (const p of f.parts || []) {
+        byMsgIdMap.set(p.messageId, f);
+      }
+    }
+  }
+
+  let hasNewFiles = false;
+  if (!cached.foldersList) cached.foldersList = [];
+  const folderById = new Map(cached.foldersList.map(f => [String(f.id), f]));
+
+  for (const msg of sorted) {
+    if (msg.id > cached.lastMessageId) cached.lastMessageId = msg.id;
+    const metadataList = parseMetadataList(msg.message);
+    for (const meta of metadataList) {
+      if (meta.t !== 'dir' || !meta.id) continue;
+      const fid = String(meta.id);
+      const existingFolder = folderById.get(fid);
+      if (existingFolder) {
+        if (existingFolder.name !== (meta.n || existingFolder.name) || existingFolder.pId !== (meta.pId || existingFolder.pId || 'root') || existingFolder.msgId !== msg.id) {
+          existingFolder.name = meta.n || existingFolder.name;
+          existingFolder.pId = meta.pId || existingFolder.pId || 'root';
+          existingFolder.msgId = msg.id;
+          hasNewFiles = true;
+        }
+      } else {
+        const nf = { id: fid, name: meta.n || 'Unnamed', pId: String(meta.pId || 'root'), msgId: msg.id };
+        cached.foldersList.push(nf);
+        folderById.set(fid, nf);
+        hasNewFiles = true;
+      }
+    }
+  }
+
+  const resolvePath = (pId: string, visiting = new Set<string>()): string | null =>
+    resolveFolderPath(pId, cached.foldersList, visiting);
+
+  for (const msg of sorted) {
+    let meta = parseMetadata(msg.message);
+    const document = msg.media?.className === 'MessageMediaDocument' ? msg.media.document as any : null;
+    const photo = msg.media?.className === 'MessageMediaPhoto' ? msg.media.photo as any : null;
+    const isUncaptionedMsg = !meta && !!(document || photo);
+
+    if (!meta && (document || photo)) {
+      const filenameAttr = document?.attributes?.find((a: any) => a.className === 'DocumentAttributeFilename');
+      if (filenameAttr?.fileName === 'playlist_order.txt' || msg.message?.includes('#ZUD_PLAYLIST_ORDER') || msg.message?.startsWith('ZUD_ORDER:')) {
+        continue;
+      }
+
+      const audioAttr = document?.attributes?.find((a: any) => a.className === 'DocumentAttributeAudio');
+      const videoAttr = document?.attributes?.find((a: any) => a.className === 'DocumentAttributeVideo');
+      const isDocAudio = document?.mimeType?.startsWith('audio/') || !!audioAttr;
+      const isDocVideo = document?.mimeType?.startsWith('video/') || !!videoAttr;
+      const isDocImage = document?.mimeType?.startsWith('image/') || !!photo;
+
+      let fn = filenameAttr?.fileName;
+      if (!fn) {
+        const rawCaption = (msg.message || '').trim();
+        if (rawCaption && !rawCaption.startsWith('{') && !rawCaption.startsWith('[')) {
+          let firstLine = rawCaption.split('\n')[0].trim();
+          firstLine = firstLine.replace(/^(?:📄\s*)?File:\s*/i, '').trim();
+          firstLine = firstLine.replace(/[\\/:*?"<>|]/g, '_');
+          if (firstLine.length > 0 && firstLine.length < 255) {
+            fn = firstLine;
+          }
+        }
+      }
+
+      if (!fn) {
+        if (audioAttr?.title) {
+          fn = audioAttr.performer ? `${audioAttr.performer} - ${audioAttr.title}.mp3` : `${audioAttr.title}.mp3`;
+        } else if (isDocVideo) {
+          fn = `Video_${msg.id}.mp4`;
+        } else if (isDocImage || photo) {
+          fn = `Image_${msg.id}.jpg`;
+        } else {
+          fn = `File_${msg.id}`;
+        }
+      }
+
+      if (fn && !fn.includes('.')) {
+        if (isDocVideo) fn += '.mp4';
+        else if (isDocAudio) fn += '.mp3';
+        else if (isDocImage || photo) fn += '.jpg';
+      }
+
+      let type = 'file';
+      if (isDocAudio) type = 'audio';
+      else if (isDocVideo) type = 'video';
+      else if (isDocImage || photo) type = 'image';
+
+      const docSize = document ? parseDocSize(document.size) : 0;
+
+      meta = {
+        n: fn,
+        pId: 'root',
+        t: type,
+        s: docSize,
+        dur: Number(audioAttr?.duration || videoAttr?.duration || 0),
+        p: 1,
+        tp: 1,
+        mime: document?.mimeType || (isDocAudio ? 'audio/mpeg' : (isDocVideo ? 'video/mp4' : (isDocImage || photo ? 'image/jpeg' : 'application/octet-stream'))),
+        performer: audioAttr?.performer,
+        title: audioAttr?.title,
+        w: videoAttr?.w,
+        h: videoAttr?.h
+      };
+    }
+
+    if (meta && meta.t !== 'dir') {
+      if (!meta.pId && !meta.path) continue;
+      const fileName = meta.n || meta.f || 'UnknownFile';
+      const resolvedDir = meta.path || resolvePath(meta.pId || 'root');
+      // NEVER drop files whose parent directory hasn't been synced yet! Keep pId so hydrate re-attaches them automatically!
+      const dirPath = resolvedDir !== null ? resolvedDir : '';
+
+      let fullPath = fileName;
+      if (dirPath !== 'Root' && dirPath !== '') fullPath = `${dirPath}/${fileName}`;
+      const uniquePath = `${channelFolderId}/${fullPath}`;
+
+      const msgId = Number(msg.id);
+      let fileEntry = byIdMap.get(uniquePath) || byMsgIdMap.get(msgId);
+      if (!fileEntry) {
+        fileEntry = {
+          id: uniquePath, name: fileName, path: fullPath,
+          mimeType: getMimeType(meta.t, fileName, meta.mime), size: 0, duration: 0, parts: [], isComplete: false,
+          performer: meta.performer, title: meta.title,
+          pId: meta.pId ? String(meta.pId) : undefined,
+          isUncaptioned: isUncaptionedMsg
+        };
+        cached.files.push(fileEntry);
+        byIdMap.set(uniquePath, fileEntry);
+        hasNewFiles = true;
+      } else {
+        if (fileEntry.id !== uniquePath) {
+          byIdMap.delete(fileEntry.id);
+          fileEntry.id = uniquePath;
+          byIdMap.set(uniquePath, fileEntry);
+        }
+        fileEntry.name = fileName;
+        fileEntry.path = fullPath;
+        if (meta.pId) fileEntry.pId = String(meta.pId);
+        fileEntry.isUncaptioned = Boolean(isUncaptionedMsg);
+        if (meta.mime) fileEntry.mimeType = getMimeType(meta.t, fileName, meta.mime);
+        if (meta.performer) fileEntry.performer = meta.performer;
+        if (meta.title) fileEntry.title = meta.title;
+      }
+
+      const telegramPartSize = document?.className === 'Document' ? parseDocSize(document.size) : 0;
+      const partSize = telegramPartSize || Number(meta.s || 0);
+      const videoAttribute = document?.attributes?.find((attribute: any) => attribute.className === 'DocumentAttributeVideo');
+      const audioAttribute = document?.attributes?.find((attribute: any) => attribute.className === 'DocumentAttributeAudio');
+      if (audioAttribute) {
+        if (audioAttribute.performer && !fileEntry.performer) fileEntry.performer = audioAttribute.performer;
+        if (audioAttribute.title && !fileEntry.title) fileEntry.title = audioAttribute.title;
+      }
+      const partDuration = Number(meta.dur || videoAttribute?.duration || audioAttribute?.duration || 0);
+      const msgVersion = Number(msg.editDate || msg.date || 0);
+      const incomingPartNum = Number(meta.p || 1);
+      const totalParts = Number(meta.tp || 1);
+
+      const maxExistingMsgId = fileEntry.parts && fileEntry.parts.length > 0
+        ? Math.max(...fileEntry.parts.map(p => p.messageId))
+        : 0;
+
+      if (fileEntry.parts && fileEntry.parts.length > 0 && msgId > maxExistingMsgId && (incomingPartNum === 1 || totalParts === 1 || totalParts < fileEntry.parts.length)) {
+        fileEntry.parts = [];
+        fileEntry.size = 0;
+        fileEntry.duration = 0;
+        fileEntry.isComplete = false;
+        hasNewFiles = true;
+      }
+
+      const existingPart = fileEntry.parts.find(p => p.partNum === incomingPartNum || p.messageId === msgId);
+      if (!existingPart) {
+        fileEntry.parts.push({
+          partNum: incomingPartNum,
+          messageId: msgId,
+          channelId: channelIdStr,
+          size: Number(partSize),
+          duration: partDuration
+        });
+        byMsgIdMap.set(msgId, fileEntry);
+        hasNewFiles = true;
+      } else {
+        let updatedPart = false;
+        if (existingPart.messageId !== msgId) {
+          existingPart.messageId = msgId;
+          byMsgIdMap.set(msgId, fileEntry);
+          updatedPart = true;
+        }
+        if (existingPart.partNum !== incomingPartNum) {
+          existingPart.partNum = incomingPartNum;
+          updatedPart = true;
+        }
+        if (partSize > 0 && existingPart.size !== partSize) {
+          existingPart.size = partSize;
+          updatedPart = true;
+        }
+        if (partDuration > 0 && existingPart.duration !== partDuration) {
+          existingPart.duration = partDuration;
+          updatedPart = true;
+        }
+        if (updatedPart) hasNewFiles = true;
+      }
+
+      if (totalParts >= 1 && fileEntry.parts.some(p => p.partNum > totalParts)) {
+        fileEntry.parts = fileEntry.parts.filter(p => p.partNum <= totalParts);
+        hasNewFiles = true;
+      }
+
+      fileEntry.parts = sanitizeFileParts(fileEntry.parts);
+      const aggregateSize = fileEntry.parts.reduce((total, part) => total + (part.size || 0), 0);
+      if (fileEntry.size !== aggregateSize) {
+        fileEntry.size = aggregateSize;
+        hasNewFiles = true;
+      }
+
+      if (meta.totalDur) {
+        fileEntry.duration = meta.totalDur;
+      } else {
+        const durationTotal = fileEntry.parts.reduce((total, part) => total + (part.duration || 0), 0);
+        if (durationTotal > 0) fileEntry.duration = durationTotal;
+      }
+
+      if (meta.w && !fileEntry.width) fileEntry.width = meta.w;
+      if (meta.h && !fileEntry.height) fileEntry.height = meta.h;
+      if (videoAttribute) {
+        if (!fileEntry.width && videoAttribute.w) fileEntry.width = videoAttribute.w;
+        if (!fileEntry.height && videoAttribute.h) fileEntry.height = videoAttribute.h;
+      }
+      if (meta.audios && (!fileEntry.audioTracks || fileEntry.audioTracks.length === 0)) fileEntry.audioTracks = meta.audios;
+      if (meta.subs && (!fileEntry.subtitleTracks || fileEntry.subtitleTracks.length === 0)) fileEntry.subtitleTracks = meta.subs;
+
+      if (msgVersion > (fileEntry.date || 0)) {
+        fileEntry.date = msgVersion;
+        hasNewFiles = true;
+      }
+
+      fileEntry.isComplete = fileEntry.parts.length === totalParts;
+    }
+  }
+  return hasNewFiles;
 };
 
 export const syncChannelFiles = async (
@@ -640,10 +997,6 @@ export const syncChannelFiles = async (
     cached.historyComplete = true;
   }
 
-  const resolvePath = (pId: string, visiting = new Set<string>()): string | null => {
-    return resolveFolderPath(pId, cached.foldersList, visiting);
-  };
-
   const byIdMap = new Map<string, VirtualFile>();
   const byMsgIdMap = new Map<number, VirtualFile>();
   for (const f of cached.files) {
@@ -653,245 +1006,8 @@ export const syncChannelFiles = async (
     }
   }
 
-  const ingestMessagesBatch = (batch: any[]): boolean => {
-    if (!batch || batch.length === 0) return false;
-    const sorted = [...batch].filter(m => m && typeof m.id === 'number').sort((a, b) => a.id - b.id);
-    if (sorted.length === 0) return false;
-
-    if (cached.files.length < 400) {
-      putMessages(channelIdStr, sorted.slice(-200) as any[]);
-    }
-
-    let hasNewFiles = false;
-    if (!cached.foldersList) cached.foldersList = [];
-    const folderById = new Map(cached.foldersList.map(f => [String(f.id), f]));
-
-    for (const msg of sorted) {
-      if (msg.id > cached.lastMessageId) cached.lastMessageId = msg.id;
-      if (!cached.minSyncedId || msg.id < cached.minSyncedId) cached.minSyncedId = msg.id;
-      const metadataList = parseMetadataList(msg.message);
-      for (const meta of metadataList) {
-        if (meta.t !== 'dir' || !meta.id) continue;
-        const fid = String(meta.id);
-        const existingFolder = folderById.get(fid);
-        if (existingFolder) {
-          existingFolder.name = meta.n || existingFolder.name;
-          existingFolder.pId = meta.pId || existingFolder.pId || 'root';
-          existingFolder.msgId = msg.id;
-          hasNewFiles = true;
-        } else {
-          const nf = { id: fid, name: meta.n || 'Unnamed', pId: String(meta.pId || 'root'), msgId: msg.id };
-          cached.foldersList.push(nf);
-          folderById.set(fid, nf);
-          hasNewFiles = true;
-        }
-      }
-    }
-
-    for (const msg of sorted) {
-      let meta = parseMetadata(msg.message);
-      const document = msg.media?.className === 'MessageMediaDocument' ? msg.media.document as any : null;
-      const photo = msg.media?.className === 'MessageMediaPhoto' ? msg.media.photo as any : null;
-      const isUncaptionedMsg = !meta && !!(document || photo);
-
-      if (!meta && (document || photo)) {
-        const filenameAttr = document?.attributes?.find((a: any) => a.className === 'DocumentAttributeFilename');
-        if (filenameAttr?.fileName === 'playlist_order.txt' || msg.message?.includes('#ZUD_PLAYLIST_ORDER') || msg.message?.startsWith('ZUD_ORDER:')) {
-          continue;
-        }
-
-        const audioAttr = document?.attributes?.find((a: any) => a.className === 'DocumentAttributeAudio');
-        const videoAttr = document?.attributes?.find((a: any) => a.className === 'DocumentAttributeVideo');
-        const isDocAudio = document?.mimeType?.startsWith('audio/') || !!audioAttr;
-        const isDocVideo = document?.mimeType?.startsWith('video/') || !!videoAttr;
-        const isDocImage = document?.mimeType?.startsWith('image/') || !!photo;
-
-        let fn = filenameAttr?.fileName;
-        if (!fn) {
-          const rawCaption = (msg.message || '').trim();
-          if (rawCaption && !rawCaption.startsWith('{') && !rawCaption.startsWith('[')) {
-            let firstLine = rawCaption.split('\n')[0].trim();
-            firstLine = firstLine.replace(/^(?:📄\s*)?File:\s*/i, '').trim();
-            firstLine = firstLine.replace(/[\\/:*?"<>|]/g, '_');
-            if (firstLine.length > 0 && firstLine.length < 255) {
-              fn = firstLine;
-            }
-          }
-        }
-
-        if (!fn) {
-          if (audioAttr?.title) {
-            fn = audioAttr.performer ? `${audioAttr.performer} - ${audioAttr.title}.mp3` : `${audioAttr.title}.mp3`;
-          } else if (isDocVideo) {
-            fn = `Video_${msg.id}.mp4`;
-          } else if (isDocImage || photo) {
-            fn = `Image_${msg.id}.jpg`;
-          } else {
-            fn = `File_${msg.id}`;
-          }
-        }
-
-        if (fn && !fn.includes('.')) {
-          if (isDocVideo) fn += '.mp4';
-          else if (isDocAudio) fn += '.mp3';
-          else if (isDocImage || photo) fn += '.jpg';
-        }
-
-        let type = 'file';
-        if (isDocAudio) type = 'audio';
-        else if (isDocVideo) type = 'video';
-        else if (isDocImage || photo) type = 'image';
-
-        const docSize = document ? parseDocSize(document.size) : 0;
-
-        meta = {
-          n: fn,
-          pId: 'root',
-          t: type,
-          s: docSize,
-          dur: Number(audioAttr?.duration || videoAttr?.duration || 0),
-          p: 1,
-          tp: 1,
-          mime: document?.mimeType || (isDocAudio ? 'audio/mpeg' : (isDocVideo ? 'video/mp4' : (isDocImage || photo ? 'image/jpeg' : 'application/octet-stream'))),
-          performer: audioAttr?.performer,
-          title: audioAttr?.title,
-          w: videoAttr?.w,
-          h: videoAttr?.h
-        };
-      }
-
-      if (meta && meta.t !== 'dir') {
-        if (!meta.pId && !meta.path) continue;
-        const fileName = meta.n || meta.f || 'UnknownFile';
-        const dirPath = meta.path || resolvePath(meta.pId || 'root');
-        if (dirPath === null) continue;
-
-        let fullPath = fileName;
-        if (dirPath !== 'Root' && dirPath !== '') fullPath = `${dirPath}/${fileName}`;
-        const uniquePath = `${channelFolder.id}/${fullPath}`;
-
-        const msgId = Number(msg.id);
-        let fileEntry = byIdMap.get(uniquePath) || byMsgIdMap.get(msgId);
-        if (!fileEntry) {
-          fileEntry = {
-            id: uniquePath, name: fileName, path: fullPath,
-            mimeType: getMimeType(meta.t, fileName, meta.mime), size: 0, duration: 0, parts: [], isComplete: false,
-            performer: meta.performer, title: meta.title,
-            isUncaptioned: isUncaptionedMsg
-          };
-          cached.files.push(fileEntry);
-          byIdMap.set(uniquePath, fileEntry);
-          hasNewFiles = true;
-        } else {
-          if (fileEntry.id !== uniquePath) {
-            byIdMap.delete(fileEntry.id);
-            fileEntry.id = uniquePath;
-            byIdMap.set(uniquePath, fileEntry);
-          }
-          fileEntry.name = fileName;
-          fileEntry.path = fullPath;
-          fileEntry.isUncaptioned = Boolean(isUncaptionedMsg);
-          if (meta.mime) fileEntry.mimeType = getMimeType(meta.t, fileName, meta.mime);
-          if (meta.performer) fileEntry.performer = meta.performer;
-          if (meta.title) fileEntry.title = meta.title;
-        }
-
-        const telegramPartSize = document?.className === 'Document' ? parseDocSize(document.size) : 0;
-        const partSize = telegramPartSize || Number(meta.s || 0);
-        const videoAttribute = document?.attributes?.find((attribute: any) => attribute.className === 'DocumentAttributeVideo');
-        const audioAttribute = document?.attributes?.find((attribute: any) => attribute.className === 'DocumentAttributeAudio');
-        if (audioAttribute) {
-          if (audioAttribute.performer && !fileEntry.performer) fileEntry.performer = audioAttribute.performer;
-          if (audioAttribute.title && !fileEntry.title) fileEntry.title = audioAttribute.title;
-        }
-        const partDuration = Number(meta.dur || videoAttribute?.duration || audioAttribute?.duration || 0);
-        const msgVersion = Number(msg.editDate || msg.date || 0);
-        const incomingPartNum = Number(meta.p || 1);
-        const totalParts = Number(meta.tp || 1);
-
-        const maxExistingMsgId = fileEntry.parts && fileEntry.parts.length > 0
-          ? Math.max(...fileEntry.parts.map(p => p.messageId))
-          : 0;
-
-        if (fileEntry.parts && fileEntry.parts.length > 0 && msgId > maxExistingMsgId && (incomingPartNum === 1 || totalParts === 1 || totalParts < fileEntry.parts.length)) {
-          fileEntry.parts = [];
-          fileEntry.size = 0;
-          fileEntry.duration = 0;
-          fileEntry.isComplete = false;
-          hasNewFiles = true;
-        }
-
-        const existingPart = fileEntry.parts.find(p => p.partNum === incomingPartNum || p.messageId === msgId);
-        if (!existingPart) {
-          fileEntry.parts.push({
-            partNum: incomingPartNum,
-            messageId: msgId,
-            channelId: channelIdStr,
-            size: Number(partSize),
-            duration: partDuration
-          });
-          byMsgIdMap.set(msgId, fileEntry);
-          hasNewFiles = true;
-        } else {
-          let updatedPart = false;
-          if (existingPart.messageId !== msgId) {
-            existingPart.messageId = msgId;
-            byMsgIdMap.set(msgId, fileEntry);
-            updatedPart = true;
-          }
-          if (existingPart.partNum !== incomingPartNum) {
-            existingPart.partNum = incomingPartNum;
-            updatedPart = true;
-          }
-          if (partSize > 0 && existingPart.size !== partSize) {
-            existingPart.size = partSize;
-            updatedPart = true;
-          }
-          if (partDuration > 0 && existingPart.duration !== partDuration) {
-            existingPart.duration = partDuration;
-            updatedPart = true;
-          }
-          if (updatedPart) hasNewFiles = true;
-        }
-
-        if (totalParts >= 1 && fileEntry.parts.some(p => p.partNum > totalParts)) {
-          fileEntry.parts = fileEntry.parts.filter(p => p.partNum <= totalParts);
-          hasNewFiles = true;
-        }
-
-        fileEntry.parts = sanitizeFileParts(fileEntry.parts);
-        const aggregateSize = fileEntry.parts.reduce((total, part) => total + (part.size || 0), 0);
-        if (fileEntry.size !== aggregateSize) {
-          fileEntry.size = aggregateSize;
-          hasNewFiles = true;
-        }
-
-        if (meta.totalDur) {
-          fileEntry.duration = meta.totalDur;
-        } else {
-          const durationTotal = fileEntry.parts.reduce((total, part) => total + (part.duration || 0), 0);
-          if (durationTotal > 0) fileEntry.duration = durationTotal;
-        }
-
-        if (meta.w && !fileEntry.width) fileEntry.width = meta.w;
-        if (meta.h && !fileEntry.height) fileEntry.height = meta.h;
-        if (videoAttribute) {
-          if (!fileEntry.width && videoAttribute.w) fileEntry.width = videoAttribute.w;
-          if (!fileEntry.height && videoAttribute.h) fileEntry.height = videoAttribute.h;
-        }
-        if (meta.audios && (!fileEntry.audioTracks || fileEntry.audioTracks.length === 0)) fileEntry.audioTracks = meta.audios;
-        if (meta.subs && (!fileEntry.subtitleTracks || fileEntry.subtitleTracks.length === 0)) fileEntry.subtitleTracks = meta.subs;
-
-        if (msgVersion > (fileEntry.date || 0)) {
-          fileEntry.date = msgVersion;
-          hasNewFiles = true;
-        }
-
-        fileEntry.isComplete = fileEntry.parts.length === totalParts;
-      }
-    }
-    return hasNewFiles;
-  };
+  const ingestMessagesBatch = (batch: any[]): boolean =>
+    ingestBatchIntoCache(channelIdStr, channelFolder.id, cached, batch, { byIdMap, byMsgIdMap });
 
   const flushToUiAndCache = async () => {
     hydrateChannelFromCache(channelFolder, cached, globalFilesMap);
@@ -935,8 +1051,21 @@ export const syncChannelFiles = async (
       }
     }
 
-    // Phase B: Initial Burst + Background Resumable Checkpoint Backfill (handles 124,000+ items!)
+    // Phase B: Instant Directory Discovery + Initial Burst + Resumable Background Backfill
     if (!cached.historyComplete) {
+      // Step B0: For large channels (> 300 msgs), discover ALL Directory definitions in <0.8s via server-side Search
+      // so subfolders created at the beginning of a 124,000-message channel appear IMMEDIATELY!
+      if ((cached.serverTotalCount || 0) > 300 || (cached.foldersList?.length || 0) === 0) {
+        try {
+          const dirMsgs = await searchChannelMessages(client, peer, 'Directory', 40);
+          if (dirMsgs.length > 0 && ingestMessagesBatch(dirMsgs)) {
+            await flushToUiAndCache();
+          }
+        } catch (dirErr) {
+          console.warn(`Directory search pre-pass skipped for channel ${channelIdStr}:`, dirErr);
+        }
+      }
+
       let offsetId = cached.minSyncedId && cached.minSyncedId > 0 ? cached.minSyncedId : 0;
       let burstPages = 0;
       let dirty = false;

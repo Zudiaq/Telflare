@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useTelegram } from '../context/TelegramContext';
 import type { StoredTelegramAccount } from '../lib/telegram';
 import { Login } from './Login';
-import { syncChannelFiles, clearChannelCache, parseMetadata, parseDocSize, hydrateChannelFromCache, loadChannelCache, getMimeType, fetchChannelTopInfo } from '../lib/vfs';
+import { syncChannelFiles, clearChannelCache, parseMetadata, parseDocSize, hydrateChannelFromCache, loadChannelCache, getMimeType, fetchChannelTopInfo, syncSubfolderOnDemand, isChannelBackfilling } from '../lib/vfs';
 import type { VirtualFolder, VirtualFile } from '../lib/vfs';
 import { Folder, File, Download, Smartphone, UploadCloud, ChevronRight, ChevronDown, LayoutGrid, List, LayoutDashboard, Loader2, X, Settings, LogOut, Play, Pause, Volume2, VolumeX, Maximize, Search, ArrowLeft, ArrowRight, Rewind, FastForward, Copy, Scissors, Trash2, Check, MoreVertical, ClipboardPaste, Edit2, FileAudio, CheckCircle2, Subtitles, Upload, Clock, Layers, AlertCircle, ShieldAlert, AlertTriangle, Sparkles, ListMusic, RotateCw, Database, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react';
 import { buildTelegramCaption } from '../lib/caption';
@@ -2485,6 +2485,7 @@ export const DriveUI: React.FC = () => {
     });
   }, []);
   const [currentFolder, setCurrentFolder] = useState<VirtualFolder | null>(null);
+  const [isSubfolderLoading, setIsSubfolderLoading] = useState(false);
   const FILE_RENDER_STEP = 120;
   const [visibleFileCount, setVisibleFileCount] = useState<number>(FILE_RENDER_STEP);
   const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
@@ -4912,8 +4913,26 @@ export const DriveUI: React.FC = () => {
     window.location.hash = `#/folder/${encodeURIComponent(folder.id)}`;
 
     const targetToSync = chanFolder || (folder.channelId ? folder : null);
-    if (targetToSync && targetToSync.isLoaded === false && client) {
-      setLoading(true);
+    const isEmptyCurrently = folder.files.length === 0 && Object.keys(folder.folders).length === 0;
+    const needsChannelSync = Boolean(
+      targetToSync &&
+      client &&
+      (targetToSync.isLoaded === false ||
+        targetToSync.historyComplete === false ||
+        (isEmptyCurrently && (targetToSync.serverTotalCount || 0) > 0))
+    );
+
+    if (folder.folderId && targetToSync && folder !== targetToSync && client && (targetToSync.historyComplete === false || isEmptyCurrently)) {
+      if (isEmptyCurrently) setIsSubfolderLoading(true);
+      try {
+        await syncSubfolderOnDemand(client, targetToSync, folder.folderId, filesMapRef.current, () => {
+          syncFolderStack();
+        });
+      } finally {
+        setIsSubfolderLoading(false);
+      }
+    } else if (needsChannelSync && targetToSync && client) {
+      if (isEmptyCurrently) setIsSubfolderLoading(true);
       try {
         await syncChannelFiles(client, targetToSync, filesMapRef.current, () => {
           syncFolderStack();
@@ -4921,7 +4940,7 @@ export const DriveUI: React.FC = () => {
       } catch (err) {
         console.error("Failed to fetch messages for channel", err);
       } finally {
-        setLoading(false);
+        setIsSubfolderLoading(false);
       }
     }
   };
@@ -6646,20 +6665,58 @@ export const DriveUI: React.FC = () => {
         );
       })()}
             
-            {isFolderLoading ? (
-              <div className="flex flex-col items-center justify-center py-20 text-gray-400 dark:text-gray-500 gap-4">
-                <div className="app-loader">
-                  <VoxelLogoLoader />
-                  <div className="app-loader__bar" />
-                </div>
-                <p className="text-sm font-medium">Loading folder contents...</p>
-              </div>
-            ) : Object.keys(displayFolder.folders).length === 0 && displayFolder.files.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-20 text-gray-400 dark:text-gray-500">
-                <Folder className="w-16 h-16 mb-4 opacity-50" />
-                <p>This folder is empty</p>
-              </div>
-            ) : null}
+            {(() => {
+              const activeChannelNode = pathStack.length > 1 ? pathStack[1] : null;
+              const activeChanIdStr = activeChannelNode ? String(activeChannelNode.channelId?.value ?? activeChannelNode.channelId ?? activeChannelNode.id) : '';
+              const activeStats = activeChannelNode ? getFolderItemStats(activeChannelNode) : null;
+              const activeServerTotal = activeChannelNode?.serverTotalCount || 0;
+              const activeIndexedCount = activeStats?.recursiveFileCount || 0;
+              const isBackfillingNow = Boolean(
+                activeChannelNode &&
+                (isChannelBackfilling(activeChanIdStr) ||
+                  (activeChannelNode.historyComplete === false && activeServerTotal > activeIndexedCount))
+              );
+              const isEmptyNow = Object.keys(displayFolder.folders).length === 0 && displayFolder.files.length === 0;
+
+              return (
+                <>
+                  {isBackfillingNow && !isEmptyNow && (
+                    <div className="mb-4 px-3.5 py-2.5 rounded-xl bg-blue-500/10 border border-blue-500/20 flex items-center justify-between gap-3 text-xs text-blue-600 dark:text-blue-300">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                        <span className="truncate font-medium">
+                          Indexing large folder in background ({activeIndexedCount.toLocaleString()} / {Math.max(activeServerTotal, activeIndexedCount).toLocaleString()} items)...
+                        </span>
+                      </div>
+                      {activeServerTotal > 0 && (
+                        <span className="font-mono font-bold shrink-0">
+                          {Math.min(99, Math.round((activeIndexedCount / activeServerTotal) * 100))}%
+                        </span>
+                      )}
+                    </div>
+                  )}
+
+                  {isFolderLoading || isSubfolderLoading || (isEmptyNow && isBackfillingNow) ? (
+                    <div className="flex flex-col items-center justify-center py-20 text-gray-400 dark:text-gray-500 gap-4">
+                      <div className="app-loader">
+                        <VoxelLogoLoader />
+                        <div className="app-loader__bar" />
+                      </div>
+                      <p className="text-sm font-medium">
+                        {isBackfillingNow && activeServerTotal > 0
+                          ? `Loading folder contents (${activeIndexedCount.toLocaleString()} / ${activeServerTotal.toLocaleString()} indexed)...`
+                          : 'Loading folder contents...'}
+                      </p>
+                    </div>
+                  ) : isEmptyNow ? (
+                    <div className="flex flex-col items-center justify-center py-20 text-gray-400 dark:text-gray-500">
+                      <Folder className="w-16 h-16 mb-4 opacity-50" />
+                      <p>This folder is empty</p>
+                    </div>
+                  ) : null}
+                </>
+              );
+            })()}
           </div>
         ) : null}
       </main>
