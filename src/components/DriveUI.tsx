@@ -3497,7 +3497,7 @@ export const DriveUI: React.FC = () => {
       if (!isMounted) return;
 
       const uncachedChannels: typeof availableChannels = [];
-      const cachedChannels: { ch: typeof availableChannels[0]; lastMessageId: number; historyComplete: boolean }[] = [];
+      const cachedChannels: { ch: typeof availableChannels[0]; lastMessageId: number; historyComplete: boolean; needsSizeSample: boolean }[] = [];
 
       for (const ch of availableChannels) {
         try {
@@ -3509,6 +3509,7 @@ export const DriveUI: React.FC = () => {
               ch,
               lastMessageId: c.lastMessageId,
               historyComplete: c.historyComplete !== false,
+              needsSizeSample: Boolean(c.lazyMode && (!c.avgFileBytes || c.avgFileBytes <= 0)),
             });
           }
         } catch (_) {
@@ -3571,7 +3572,7 @@ export const DriveUI: React.FC = () => {
             syncFolderStack();
           }
 
-          if (topId !== item.lastMessageId || !item.historyComplete) {
+          if (topId !== item.lastMessageId || !item.historyComplete || item.needsSizeSample) {
             await syncChannelFiles(client, channelFolder, filesMapRef.current, () => {
               if (!isMounted) return;
               syncFolderStack();
@@ -5215,17 +5216,22 @@ export const DriveUI: React.FC = () => {
       totalBytes += (file.size || 0);
     }
 
-    // Include serverTotalCount for massive/lazy channels whose 124k+ items are loaded on demand
+    // Include serverTotalCount & estimatedTotalBytes for massive/lazy channels (126k+ items)
     let unhydratedServerItems = 0;
+    let estimatedExtraBytes = 0;
+    let hasEstimate = false;
     if (root && root.folders) {
       for (const ch of Object.values(root.folders)) {
         const srvTotal = ch.serverTotalCount || 0;
-        if (srvTotal <= 0) continue;
         let chLoaded = 0;
+        let chLoadedBytes = 0;
         const st: VirtualFolder[] = [ch];
         while (st.length > 0) {
           const node = st.pop()!;
-          chLoaded += (node.files || []).length;
+          for (const f of node.files || []) {
+            chLoaded += 1;
+            chLoadedBytes += (f.size || 0);
+          }
           if (node.folders) {
             for (const sub of Object.values(node.folders)) st.push(sub);
           }
@@ -5233,12 +5239,17 @@ export const DriveUI: React.FC = () => {
         if (srvTotal > chLoaded) {
           unhydratedServerItems += (srvTotal - chLoaded);
         }
+        if (ch.isLazyChannel && ch.estimatedTotalBytes && ch.estimatedTotalBytes > chLoadedBytes) {
+          estimatedExtraBytes += (ch.estimatedTotalBytes - chLoadedBytes);
+          hasEstimate = true;
+        }
       }
     }
 
+    const finalBytes = totalBytes + estimatedExtraBytes;
     return {
-      bytes: totalBytes,
-      formatted: formatSize(totalBytes),
+      bytes: finalBytes,
+      formatted: `${hasEstimate ? '~' : ''}${formatSize(finalBytes)}`,
       fileCount: uniqueFiles.size + unhydratedServerItems,
     };
   }, [pathStack, currentFolder, isRefreshing]);
@@ -7550,7 +7561,7 @@ export const DriveUI: React.FC = () => {
             </header>
           )}
           
-          <div className={`flex-1 flex justify-center overflow-hidden p-0 ${activeFile.mimeType === 'application/pdf' || activeFile.name.toLowerCase().endsWith('.pdf') ? 'items-stretch' : 'items-center sm:p-4'}`}>
+          <div className={`flex-1 min-h-0 flex justify-center overflow-hidden p-0 ${activeFile.mimeType === 'application/pdf' || activeFile.name.toLowerCase().endsWith('.pdf') || activeFile.mimeType.startsWith('image/') ? 'items-stretch' : 'items-center sm:p-4'}`}>
             {activeFile.mimeType.startsWith('video/') ? (
               <CustomVideoPlayer 
                 key={activeFile.id}

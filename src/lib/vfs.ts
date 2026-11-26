@@ -273,6 +273,7 @@ export interface VirtualFolder {
   msgId?: number;
   folderId?: string;
   serverTotalCount?: number;
+  estimatedTotalBytes?: number;
   historyComplete?: boolean;
   isLazyChannel?: boolean;
   subfolderSynced?: boolean;
@@ -293,6 +294,7 @@ export interface CachedChannel {
   historyComplete?: boolean;
   lazyMode?: boolean;
   serverTotalCount?: number;
+  avgFileBytes?: number;
   files: VirtualFile[];
   foldersList?: FolderEntry[];
   counts?: Record<string, {
@@ -614,6 +616,23 @@ export const parseDocSize = (size: any): number => {
   return isNaN(n) ? 0 : n;
 };
 
+export const parsePhotoSize = (photo: any): number => {
+  if (!photo || !Array.isArray(photo.sizes)) return 0;
+  let maxBytes = 0;
+  for (const sz of photo.sizes) {
+    if (!sz) continue;
+    if (typeof sz.size === 'number' && sz.size > maxBytes) {
+      maxBytes = sz.size;
+    } else if (Array.isArray(sz.sizes) && sz.sizes.length > 0) {
+      const last = Number(sz.sizes[sz.sizes.length - 1] || 0);
+      if (last > maxBytes) maxBytes = last;
+    } else if (sz.bytes && typeof sz.bytes.length === 'number' && sz.bytes.length > maxBytes) {
+      maxBytes = sz.bytes.length;
+    }
+  }
+  return maxBytes;
+};
+
 export const parseMetadataList = (caption?: string): FileMetadata[] => {
   try {
     if (!caption) return [];
@@ -904,6 +923,9 @@ export const hydrateChannelFromCache = (
   }
 
   channelFolder.serverTotalCount = cached.serverTotalCount;
+  if (cached.lazyMode && cached.avgFileBytes && cached.avgFileBytes > 0 && cached.serverTotalCount && cached.serverTotalCount > 0) {
+    channelFolder.estimatedTotalBytes = Math.round(cached.avgFileBytes * cached.serverTotalCount);
+  }
   channelFolder.historyComplete = cached.lazyMode ? true : cached.historyComplete;
   markFoldersLoaded(channelFolder);
 };
@@ -1040,7 +1062,7 @@ const parseMessagesIntoFilesAndFolders = (
       else if (isDocVideo) type = 'video';
       else if (isDocImage || photo) type = 'image';
 
-      const docSize = document ? parseDocSize(document.size) : 0;
+      const docSize = document ? parseDocSize(document.size) : (photo ? parsePhotoSize(photo) : 0);
 
       meta = {
         n: fn,
@@ -1105,7 +1127,9 @@ const parseMessagesIntoFilesAndFolders = (
         if (meta.title) fileEntry.title = meta.title;
       }
 
-      const telegramPartSize = document?.className === 'Document' ? parseDocSize(document.size) : 0;
+      const telegramPartSize = document?.className === 'Document'
+        ? parseDocSize(document.size)
+        : (photo ? parsePhotoSize(photo) : 0);
       const partSize = telegramPartSize || Number(meta.s || 0);
       const videoAttribute = document?.attributes?.find((attribute: any) => attribute.className === 'DocumentAttributeVideo');
       const audioAttribute = document?.attributes?.find((attribute: any) => attribute.className === 'DocumentAttributeAudio');
@@ -1775,6 +1799,40 @@ export const syncChannelFiles = async (
             await mergeDeltaFilesIntoLazyBuckets(channelIdStr, parsedFiles);
           }
           if (hasNewFiles || hasNewFolders || cached.files.length > 0) lazyDirty = true;
+        }
+      }
+
+      // Sample average file byte size ONCE for lazyMode channels so total storage size includes all 126,000+ items!
+      if (!cached.avgFileBytes || cached.avgFileBytes <= 0) {
+        let sampleSum = 0;
+        let sampleCount = 0;
+        for (const f of cached.files) {
+          if (f.size > 0) {
+            sampleSum += f.size;
+            sampleCount++;
+          }
+        }
+        if (sampleCount < 10) {
+          try {
+            const { messages: sampleMsgs } = await fetchSingleHistoryPage(client, peer, { limit: 60 });
+            for (const m of sampleMsgs || []) {
+              const doc = m?.media?.className === 'MessageMediaDocument' ? m.media.document : null;
+              const ph = m?.media?.className === 'MessageMediaPhoto' ? m.media.photo : null;
+              const meta = parseMetadata(m?.message);
+              const bytes = (doc ? parseDocSize(doc.size) : 0) || (ph ? parsePhotoSize(ph) : 0) || Number(meta?.s || 0);
+              if (bytes > 0) {
+                sampleSum += bytes;
+                sampleCount++;
+              }
+            }
+          } catch {}
+        }
+        if (sampleCount > 0) {
+          cached.avgFileBytes = Math.round(sampleSum / sampleCount);
+          if (cached.serverTotalCount && cached.serverTotalCount > 0) {
+            channelFolder.estimatedTotalBytes = Math.round(cached.avgFileBytes * cached.serverTotalCount);
+          }
+          lazyDirty = true;
         }
       }
 
