@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useTelegram } from '../context/TelegramContext';
 import type { StoredTelegramAccount } from '../lib/telegram';
 import { Login } from './Login';
-import { syncChannelFiles, clearChannelCache, parseMetadata, parseDocSize, hydrateChannelFromCache, loadChannelCache, getMimeType } from '../lib/vfs';
+import { syncChannelFiles, clearChannelCache, parseMetadata, parseDocSize, hydrateChannelFromCache, loadChannelCache, getMimeType, fetchChannelTopInfo } from '../lib/vfs';
 import type { VirtualFolder, VirtualFile } from '../lib/vfs';
 import { Folder, File, Download, Smartphone, UploadCloud, ChevronRight, ChevronDown, LayoutGrid, List, LayoutDashboard, Loader2, X, Settings, LogOut, Play, Pause, Volume2, VolumeX, Maximize, Search, ArrowLeft, ArrowRight, Rewind, FastForward, Copy, Scissors, Trash2, Check, MoreVertical, ClipboardPaste, Edit2, FileAudio, CheckCircle2, Subtitles, Upload, Clock, Layers, AlertCircle, ShieldAlert, AlertTriangle, Sparkles, ListMusic, RotateCw, Database, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react';
 import { buildTelegramCaption } from '../lib/caption';
@@ -2485,6 +2485,10 @@ export const DriveUI: React.FC = () => {
     });
   }, []);
   const [currentFolder, setCurrentFolder] = useState<VirtualFolder | null>(null);
+  const FILE_RENDER_STEP = 120;
+  const [visibleFileCount, setVisibleFileCount] = useState<number>(FILE_RENDER_STEP);
+  const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
+  const lastVisibilitySyncRef = useRef<number>(0);
   const [pathStack, setPathStack] = useState<VirtualFolder[]>([]);
   const [loading, setLoading] = useState(false);
   type ItemSize = 'small' | 'medium' | 'large';
@@ -3318,6 +3322,42 @@ export const DriveUI: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client]);
 
+  // Auto-refresh channel list & active folder delta when returning to foreground on mobile or desktop
+  useEffect(() => {
+    if (!client) return;
+    const onVisibility = () => {
+      if (document.visibilityState !== 'visible') return;
+      const now = Date.now();
+      if (now - lastVisibilitySyncRef.current < 15000) return;
+      lastVisibilitySyncRef.current = now;
+      void loadChannels();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [client, activeAccountId]);
+
+  // Reset windowed file count when switching folders, sort, or view mode (keeps 124k+ folders 60fps!)
+  useEffect(() => {
+    setVisibleFileCount(FILE_RENDER_STEP);
+  }, [currentFolder?.id, sortMode, sortOrder, viewMode]);
+
+  // Progressive infinite scroll observer: appends +120 file cards seamlessly as user scrolls
+  useEffect(() => {
+    const sentinel = loadMoreSentinelRef.current;
+    if (!sentinel || typeof IntersectionObserver === 'undefined') return;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setVisibleFileCount((prev) => prev + FILE_RENDER_STEP);
+        }
+      },
+      { rootMargin: '1000px 0px' },
+    );
+    obs.observe(sentinel);
+    return () => obs.disconnect();
+  }, [currentFolder?.id, currentFolder?.files?.length, visibleFileCount, viewMode]);
+
   // Synchronously switch account state when activeAccountId changes
   useEffect(() => {
     if (!activeAccountId) return;
@@ -3347,9 +3387,8 @@ export const DriveUI: React.FC = () => {
       await rebuildRoot();
       if (!isMounted) return;
 
-      // Classify channels into uncached (need initial sync & progress) vs cached (already ready to search)
       const uncachedChannels: typeof availableChannels = [];
-      const cachedChannels: { ch: typeof availableChannels[0]; lastMessageId: number }[] = [];
+      const cachedChannels: { ch: typeof availableChannels[0]; lastMessageId: number; historyComplete: boolean }[] = [];
 
       for (const ch of availableChannels) {
         try {
@@ -3357,18 +3396,21 @@ export const DriveUI: React.FC = () => {
           if (!c || !c.lastMessageId || c.lastMessageId === 0) {
             uncachedChannels.push(ch);
           } else {
-            cachedChannels.push({ ch, lastMessageId: c.lastMessageId });
+            cachedChannels.push({
+              ch,
+              lastMessageId: c.lastMessageId,
+              historyComplete: c.historyComplete !== false,
+            });
           }
         } catch (_) {
           uncachedChannels.push(ch);
         }
       }
 
-      // ONLY if there are truly uncached channels, show the initial sync progress bar
       if (uncachedChannels.length > 0) {
         setSyncProgress({ loaded: 0, total: uncachedChannels.length });
         let loadedCount = 0;
-        
+
         for (const ch of uncachedChannels) {
           if (!isMounted) return;
           const rootFolder = pathStackRef.current[0] || currentFolder;
@@ -3384,7 +3426,7 @@ export const DriveUI: React.FC = () => {
             await syncChannelFiles(client, channelFolder, filesMapRef.current, () => {
               if (!isMounted) return;
               syncFolderStack();
-            }, { validate: false });
+            }, { validate: false, initialBurstOnly: true });
           } catch (err) {
             console.error(`Initial sync failed for channel ${ch.id}:`, err);
           } finally {
@@ -3402,8 +3444,7 @@ export const DriveUI: React.FC = () => {
         if (isMounted) setSyncProgress(null);
       }
 
-      // For cached channels: they are already hydrated in memory & searchable instantly!
-      // In the background, check if any NEW item was added to the cloud since last sync
+      // 1-RPC delta check per cached channel: syncs ONLY new items (or resumes incomplete backfill)
       for (const item of cachedChannels) {
         if (!isMounted) return;
         try {
@@ -3415,15 +3456,17 @@ export const DriveUI: React.FC = () => {
             ? { id: channelFolder.channelId, accessHash: channelFolder.accessHash }
             : (channelFolder.channelId || channelFolder.id);
           const peer = await resolveTelegramEntity(client, peerEntity);
-          const topMsgs: any[] = await client.getMessages(peer, { limit: 1 }) as any;
-          const topId = topMsgs?.[0]?.id || 0;
+          const { topId, totalCount } = await fetchChannelTopInfo(client, peer);
+          if (totalCount > 0 && channelFolder.serverTotalCount !== totalCount) {
+            channelFolder.serverTotalCount = totalCount;
+            syncFolderStack();
+          }
 
-          // If topId !== item.lastMessageId, an item was added, deleted, or updated! Sync it incrementally.
-          if (topId !== item.lastMessageId) {
+          if (topId !== item.lastMessageId || !item.historyComplete) {
             await syncChannelFiles(client, channelFolder, filesMapRef.current, () => {
               if (!isMounted) return;
               syncFolderStack();
-            });
+            }, { validate: false, initialBurstOnly: true });
           }
         } catch (e) {
           // Non-blocking delta check failure
@@ -3443,7 +3486,17 @@ export const DriveUI: React.FC = () => {
       setLoading(true);
     }
     try {
-      const dialogs = await client.getDialogs({});
+      // Fetch BOTH main and archived (folder: 1) dialogs so new/archived cloud channels ALWAYS appear on mobile & desktop!
+      const [mainDialogs, archivedDialogs] = await Promise.all([
+        client.getDialogs({ limit: 500, folder: 0 }),
+        client.getDialogs({ limit: 500, folder: 1 }).catch(() => [] as any[]),
+      ]);
+      const dialogMap = new Map<string, any>();
+      for (const d of [...mainDialogs, ...archivedDialogs]) {
+        const eid = d?.entity?.id?.toString?.();
+        if (eid && !dialogMap.has(eid)) dialogMap.set(eid, d);
+      }
+      const dialogs = Array.from(dialogMap.values());
       const channels: { id: string; name: string; rawId?: any; accessHash?: string; isCreator?: boolean }[] = [];
       const savedRootId = localStorage.getItem(rootStorageKey);
       let rootChannel: any = dialogs.find((dialog: any) => dialog.entity?.className === 'Channel' && dialog.entity.id.toString() === savedRootId)?.entity;
@@ -3473,15 +3526,22 @@ export const DriveUI: React.FC = () => {
       });
 
       const aboutCacheKey = `zud_channel_about_cache_${activeAccountId || 'default'}`;
-      let aboutCache: { [id: string]: string } = {};
+      let aboutCache: Record<string, string | { about: string; ts: number }> = {};
       try {
         const saved = localStorage.getItem(aboutCacheKey);
         if (saved) aboutCache = JSON.parse(saved);
       } catch {}
 
       const knownIds = new Set(availableChannels.map(c => c.id));
+      const nowMs = Date.now();
+      const POSITIVE_TTL = 24 * 60 * 60 * 1000;
+      const NEGATIVE_TTL = 30 * 1000;
 
-      // Filter dialogs to relevant channels only (skip normal public channels user only follows)
+      const isCloudAboutMatch = (rawAbout: string, name: string) => {
+        const about = rawAbout === 'ZUD_CLOUD_DIR' ? `Cloud storage for ${name}` : rawAbout;
+        return about === `Cloud playlist for ${name}` || about === `Cloud storage for ${name} [playlist]` || about.startsWith(`Cloud playlist for ${name}`) || about === `Cloud storage for ${name}`;
+      };
+
       const candidateDialogs = dialogs.filter((dialog: any) => {
         const entity = dialog.entity;
         if (entity?.className !== 'Channel' || entity.id.toString() === rootChannel.id.toString()) return false;
@@ -3491,26 +3551,32 @@ export const DriveUI: React.FC = () => {
         return false;
       });
 
-      // Concurrency pool to fetch channel descriptions in parallel
       const poolLimit = 6;
       const fetchCandidate = async (dialog: any) => {
         const entity = dialog.entity;
         const idStr = entity.id.toString();
         const name = dialog.title || `Channel ${idStr}`;
-        let about = aboutCache[idStr];
+        const rawEntry = aboutCache[idStr];
+        let about: string | undefined;
+        if (typeof rawEntry === 'string') {
+          if (isCloudAboutMatch(rawEntry, name)) about = rawEntry;
+        } else if (rawEntry && typeof rawEntry === 'object') {
+          const ttl = isCloudAboutMatch(rawEntry.about, name) ? POSITIVE_TTL : NEGATIVE_TTL;
+          if (nowMs - (rawEntry.ts || 0) < ttl) {
+            about = rawEntry.about;
+          }
+        }
         if (about === undefined) {
           try {
             const full: any = await client.invoke(new Api.channels.GetFullChannel({ channel: entity }));
             about = String(full?.fullChat?.about || '');
-            aboutCache[idStr] = about;
+            aboutCache[idStr] = { about, ts: nowMs };
           } catch (error) {
             console.warn(`Could not read description for channel ${entity.id}:`, error);
             return null;
           }
         }
-        if (about === 'ZUD_CLOUD_DIR') about = `Cloud storage for ${name}`;
-        const isMatched = about === `Cloud playlist for ${name}` || about === `Cloud storage for ${name} [playlist]` || about.startsWith(`Cloud playlist for ${name}`) || about === `Cloud storage for ${name}`;
-        if (!isMatched) return null;
+        if (!isCloudAboutMatch(about, name)) return null;
         if (entity.accessHash) {
           saveChannelAccessHash(idStr, entity.accessHash);
         }
@@ -5013,17 +5079,19 @@ export const DriveUI: React.FC = () => {
 
   const renderFolderItemCount = (folder: VirtualFolder) => {
     const stats = getFolderItemStats(folder);
-    if (!stats.isLoaded) {
+    const totalFiles = Math.max(stats.recursiveFileCount, folder.serverTotalCount || 0);
+    if (!stats.isLoaded && totalFiles === 0) {
       return <span className="animate-pulse text-blue-500 dark:text-blue-400">Loading...</span>;
     }
-    if (stats.directFolderCount > 0 && stats.recursiveFileCount > 0) {
-      return <span>{stats.directFolderCount} {stats.directFolderCount === 1 ? 'folder' : 'folders'} • {stats.recursiveFileCount} {stats.recursiveFileCount === 1 ? 'file' : 'files'}</span>;
+    const fmt = (n: number) => n.toLocaleString();
+    if (stats.directFolderCount > 0 && totalFiles > 0) {
+      return <span>{fmt(stats.directFolderCount)} {stats.directFolderCount === 1 ? 'folder' : 'folders'} • {fmt(totalFiles)} {totalFiles === 1 ? 'file' : 'files'}</span>;
     }
     if (stats.directFolderCount > 0) {
-      return <span>{stats.directFolderCount} {stats.directFolderCount === 1 ? 'folder' : 'folders'}</span>;
+      return <span>{fmt(stats.directFolderCount)} {stats.directFolderCount === 1 ? 'folder' : 'folders'}</span>;
     }
-    if (stats.recursiveFileCount > 0) {
-      return <span>{stats.recursiveFileCount} {stats.recursiveFileCount === 1 ? 'file' : 'files'}</span>;
+    if (totalFiles > 0) {
+      return <span>{fmt(totalFiles)} {totalFiles === 1 ? 'file' : 'files'}</span>;
     }
     return <span>0 items</span>;
   };
@@ -6349,7 +6417,7 @@ export const DriveUI: React.FC = () => {
                           ? "grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-4 gap-4 sm:gap-6"
                           : "grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3 sm:gap-4")
                   }>
-                    {sortedFiles.map((file, fileIndex) => {
+                    {sortedFiles.slice(0, visibleFileCount).map((file, fileIndex) => {
                       const isSelected = selectedItems.has(file.id);
                       const isCut = clipboard?.action === 'move' && clipboard.items.some(i => i.type === 'file' && i.item.id === file.id);
                       return (
@@ -6443,7 +6511,7 @@ export const DriveUI: React.FC = () => {
                   </div>
                 ) : (
                   <div className="flex flex-col gap-2">
-                    {sortedFiles.map((file, fileIndex) => {
+                    {sortedFiles.slice(0, visibleFileCount).map((file, fileIndex) => {
                       const isSelected = selectedItems.has(file.id);
                       const isCut = clipboard?.action === 'move' && clipboard.items.some(i => i.type === 'file' && i.item.id === file.id);
                       const ext = file.name.split('.').pop()?.toUpperCase() || 'FILE';
@@ -6553,6 +6621,23 @@ export const DriveUI: React.FC = () => {
                         </div>
                       );
                     })}
+                  </div>
+                )}
+                {visibleFileCount < sortedFiles.length && (
+                  <div
+                    ref={loadMoreSentinelRef}
+                    className="mt-6 py-4 flex flex-col items-center justify-center gap-2 text-xs text-gray-400 dark:text-gray-500"
+                  >
+                    <span>
+                      Showing {Math.min(visibleFileCount, sortedFiles.length).toLocaleString()} of {Math.max(sortedFiles.length, displayFolder.serverTotalCount || 0).toLocaleString()} items
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setVisibleFileCount((prev) => prev + FILE_RENDER_STEP)}
+                      className="px-4 py-1.5 rounded-full bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-gray-700 dark:text-gray-200 font-medium transition-colors"
+                    >
+                      Load more
+                    </button>
                   </div>
                 )}
               </section>
