@@ -4,13 +4,16 @@ import { MediaLoadingText } from './MediaLoadingText';
 
 /* ============================================================================
  * COMPONENT: ImageViewer
- * Full-viewport touch and mouse interactive image viewer with zoom, pan,
- * double-tap/click zoom, and swipe controls (desktop & mobile).
+ * Full-viewport touch and mouse interactive image viewer with native-resolution
+ * crisp zoom (zero GPU texture blur), pan, double-tap/click zoom, and swipe.
  * ============================================================================ */
 export const ImageViewer: React.FC<{ src: string, alt: string, onSwipe?: (direction: -1 | 1) => void }> = ({ src, alt, onSwipe }) => {
   const [isLoaded, setIsLoaded] = useState(false);
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [naturalSize, setNaturalSize] = useState<{ w: number; h: number } | null>(null);
+  const [viewportSize, setViewportSize] = useState<{ w: number; h: number } | null>(null);
+
   const containerRef = useRef<HTMLDivElement | null>(null);
   const pointers = useRef(new Map<number, { x: number, y: number }>());
   const pinchRef = useRef<{ distance: number, scale: number } | null>(null);
@@ -22,6 +25,25 @@ export const ImageViewer: React.FC<{ src: string, alt: string, onSwipe?: (direct
   const clampScale = (value: number) => Math.min(8, Math.max(1, value));
   const distance = (a: { x: number, y: number }, b: { x: number, y: number }) =>
     Math.hypot(a.x - b.x, a.y - b.y);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const updateSize = () => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        setViewportSize({ w: rect.width, h: rect.height });
+      }
+    };
+    updateSize();
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(updateSize);
+      ro.observe(el);
+      return () => ro.disconnect();
+    }
+    window.addEventListener('resize', updateSize);
+    return () => window.removeEventListener('resize', updateSize);
+  }, []);
 
   const getViewportCenter = (element: HTMLElement) => {
     const rect = element.getBoundingClientRect();
@@ -58,6 +80,7 @@ export const ImageViewer: React.FC<{ src: string, alt: string, onSwipe?: (direct
 
   useEffect(() => {
     setIsLoaded(false);
+    setNaturalSize(null);
     reset();
   }, [reset, src]);
 
@@ -162,6 +185,29 @@ export const ImageViewer: React.FC<{ src: string, alt: string, onSwipe?: (direct
     }
   };
 
+  // Compute exact fitted base dimensions so zoomed <img> uses real layout pixels
+  // (forces the browser to sample directly from the full native resolution bitmap with zero GPU-scale blur!)
+  let renderedStyle: React.CSSProperties;
+  if (naturalSize && viewportSize && naturalSize.w > 0 && naturalSize.h > 0) {
+    const fitRatio = Math.min(viewportSize.w / naturalSize.w, viewportSize.h / naturalSize.h);
+    const baseW = naturalSize.w * fitRatio;
+    const baseH = naturalSize.h * fitRatio;
+    renderedStyle = {
+      width: `${baseW * scale}px`,
+      height: `${baseH * scale}px`,
+      maxWidth: 'none',
+      maxHeight: 'none',
+      transform: `translate3d(${offset.x}px, ${offset.y}px, 0)`,
+      imageRendering: 'auto',
+    };
+  } else {
+    renderedStyle = {
+      transform: `translate3d(${offset.x}px, ${offset.y}px, 0) scale(${scale})`,
+      transformOrigin: 'center center',
+      imageRendering: 'auto',
+    };
+  }
+
   return (
     <div
       ref={containerRef}
@@ -183,9 +229,15 @@ export const ImageViewer: React.FC<{ src: string, alt: string, onSwipe?: (direct
         draggable={false}
         loading="eager"
         decoding="async"
-        className={`max-w-full max-h-full object-contain will-change-transform transition-opacity duration-200 ${scale > 1.01 ? 'cursor-grab active:cursor-grabbing' : 'cursor-zoom-in'} ${isLoaded ? 'opacity-100' : 'opacity-0'}`}
-        style={{ transform: `translate3d(${offset.x}px, ${offset.y}px, 0) scale(${scale})`, transformOrigin: 'center center' }}
-        onLoad={() => setIsLoaded(true)}
+        className={`shrink-0 object-contain transition-opacity duration-200 ${!naturalSize ? 'max-w-full max-h-full' : ''} ${scale > 1.01 ? 'cursor-grab active:cursor-grabbing' : 'cursor-zoom-in'} ${isLoaded ? 'opacity-100' : 'opacity-0'}`}
+        style={renderedStyle}
+        onLoad={(e) => {
+          const img = e.currentTarget;
+          if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+            setNaturalSize({ w: img.naturalWidth, h: img.naturalHeight });
+          }
+          setIsLoaded(true);
+        }}
       />
       {!isLoaded && (
         <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/35 backdrop-blur-sm">

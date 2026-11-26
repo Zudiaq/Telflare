@@ -4595,12 +4595,33 @@ export const DriveUI: React.FC = () => {
                 });
               } else if (msg.media.className === 'MessageMediaPhoto' && msg.media.photo) {
                 const photo = msg.media.photo as Api.Photo;
-                const sizes = photo.sizes as any[];
+                const sizes = Array.isArray(photo.sizes) ? (photo.sizes as any[]) : [];
+                // Always pick the absolute highest-resolution downloadable photo variant (never rely on array order!)
+                const downloadableSizes = sizes.filter(
+                  (s: any) =>
+                    s &&
+                    s.type &&
+                    s.className !== 'PhotoStrippedSize' &&
+                    s.className !== 'PhotoPathSize' &&
+                    s.className !== 'PhotoSizeEmpty' &&
+                    s.className !== 'VideoSize'
+                );
+                const getSizeRank = (s: any) => {
+                  const area = Number(s.w || 0) * Number(s.h || 0);
+                  const bytes = typeof s.size === 'number'
+                    ? s.size
+                    : (Array.isArray(s.sizes) && s.sizes.length > 0 ? Number(s.sizes[s.sizes.length - 1] || 0) : 0);
+                  const typeOrder: Record<string, number> = { w: 6, z: 5, y: 4, x: 3, m: 2, s: 1 };
+                  return area * 1000 + bytes + (typeOrder[String(s.type)] || 0);
+                };
+                const bestSize = downloadableSizes.length > 0
+                  ? [...downloadableSizes].sort((a, b) => getSizeRank(b) - getSizeRank(a))[0]
+                  : sizes[sizes.length - 1];
                 location = new Api.InputPhotoFileLocation({
                   id: photo.id,
                   accessHash: photo.accessHash,
                   fileReference: photo.fileReference,
-                  thumbSize: sizes[sizes.length - 1].type
+                  thumbSize: String(bestSize?.type || 'y')
                 });
               } else {
                 throw new Error("Unsupported media type for streaming");
