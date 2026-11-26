@@ -50,26 +50,27 @@ const resolveFolderPathFast = (
   lookup: FolderLookup,
   visiting?: Set<string>,
 ): string | null => {
-  if (!pId || pId === 'root') return '';
+  if (!pId || pId === 'root' || pId === '0') return '';
   const key = String(pId);
   if (lookup.pathCache.has(key)) return lookup.pathCache.get(key)!;
-  if (visiting?.has(key)) return null;
+  if (visiting?.has(key)) return '';
 
   const folder = lookup.byId.get(key);
   if (!folder) {
+    // Unknown/missing parent ID: return null when resolving a FILE's pId,
+    // but for a FOLDER whose own parent is missing we hoist it to root below!
     lookup.pathCache.set(key, null);
     return null;
   }
 
   const nextVisiting = visiting || new Set<string>();
   nextVisiting.add(key);
-  const parentPath = resolveFolderPathFast(folder.pId, lookup, nextVisiting);
+  const rawParentPath = resolveFolderPathFast(folder.pId, lookup, nextVisiting);
   nextVisiting.delete(key);
 
-  if (parentPath === null) {
-    lookup.pathCache.set(key, null);
-    return null;
-  }
+  // CRITICAL: NEVER drop a folder just because its parent folder wasn't fetched or was deleted!
+  // Hoist orphan folders to channel root so they (and all their children) ALWAYS render!
+  const parentPath = rawParentPath === null ? '' : rawParentPath;
   const full = parentPath ? `${parentPath}/${folder.name}` : folder.name;
   lookup.pathCache.set(key, full);
   return full;
@@ -119,6 +120,48 @@ const searchChannelMessages = async (
     }
     if (msgs.length < HISTORY_PAGE) break;
     offsetId = msgs[msgs.length - 1].id;
+  }
+  return out;
+};
+
+const fetchOldestHistoryPages = async (
+  client: TelegramClient,
+  peer: any,
+  pages = 2,
+): Promise<any[]> => {
+  const out: any[] = [];
+  let minOffsetId = 1;
+  for (let p = 0; p < pages; p++) {
+    try {
+      const res: any = await gate(1, async () => {
+        await ensureTelegramConnected(client);
+        return client.invoke(
+          new Api.messages.GetHistory({
+            peer,
+            limit: HISTORY_PAGE,
+            offsetId: minOffsetId,
+            offsetDate: 0,
+            addOffset: -HISTORY_PAGE,
+            maxId: 0,
+            minId: 0,
+            hash: 0 as any,
+          }),
+        );
+      });
+      const msgs: any[] = Array.isArray(res?.messages) ? res.messages : [];
+      if (msgs.length === 0) break;
+      let maxIdInPage = 0;
+      for (const m of msgs) {
+        if (m && typeof m.id === 'number') {
+          out.push(m);
+          if (m.id > maxIdInPage) maxIdInPage = m.id;
+        }
+      }
+      if (msgs.length < HISTORY_PAGE || maxIdInPage <= minOffsetId) break;
+      minOffsetId = maxIdInPage + 1;
+    } catch {
+      break;
+    }
   }
   return out;
 };
@@ -1615,7 +1658,7 @@ export const syncChannelFiles = async (
     }
 
     // Phase B (LAZY CLOUD MODE for 1,500 – 500,000+ item channels):
-    // Ultra-fast Directory discovery (< 1s) + 200-item head burst, ZERO 20-minute backfill crawl!
+    // Ultra-fast 3-layer Directory discovery (< 1s) + guaranteed non-empty root, ZERO 20-minute backfill crawl!
     if (cached.lazyMode) {
       let lazyDirty = false;
       const needDirDiscovery =
@@ -1624,13 +1667,16 @@ export const syncChannelFiles = async (
 
       if (needDirDiscovery) {
         try {
+          if (!cached.foldersList) cached.foldersList = [];
+          const dummyFiles: VirtualFile[] = [];
+
+          // Layer 1: Telegram server-side search for 'Directory' captions (up to 8,000 dirs)
           let dirMsgs = await searchChannelMessages(client, peer, 'Directory', DIR_SEARCH_MAX_PAGES);
+          // Layer 2: Fallback search for '"t": "dir"' or 'dir' if Layer 1 returned 0
           if (dirMsgs.length === 0) {
-            dirMsgs = await searchChannelMessages(client, peer, 'dir', 25);
+            dirMsgs = await searchChannelMessages(client, peer, 'dir', 30);
           }
           if (dirMsgs.length > 0) {
-            if (!cached.foldersList) cached.foldersList = [];
-            const dummyFiles: VirtualFile[] = [];
             const { hasNewFolders, maxMsgId } = parseMessagesIntoFilesAndFolders(
               channelIdStr,
               channelFolder.id,
@@ -1641,13 +1687,63 @@ export const syncChannelFiles = async (
             if (maxMsgId > cached.lastMessageId) cached.lastMessageId = maxMsgId;
             if (hasNewFolders) lazyDirty = true;
           }
+
+          // Layer 3: Always probe the BEGINNING of the channel (oldest 200 msgs, IDs 1..200) if
+          // foldersList is still empty OR if any discovered folder has a missing ancestor pId!
+          const folderIdSet = new Set(cached.foldersList.map(f => String(f.id)));
+          const missingParents = new Set<string>();
+          for (const f of cached.foldersList) {
+            if (f.pId && f.pId !== 'root' && f.pId !== '0' && !folderIdSet.has(String(f.pId))) {
+              missingParents.add(String(f.pId));
+            }
+          }
+
+          if (cached.foldersList.length === 0 || missingParents.size > 0) {
+            const oldestMsgs = await fetchOldestHistoryPages(client, peer, 2);
+            if (oldestMsgs.length > 0) {
+              const { hasNewFolders, maxMsgId } = parseMessagesIntoFilesAndFolders(
+                channelIdStr,
+                channelFolder.id,
+                cached.foldersList,
+                dummyFiles,
+                oldestMsgs,
+              );
+              if (maxMsgId > cached.lastMessageId) cached.lastMessageId = maxMsgId;
+              if (hasNewFolders) lazyDirty = true;
+            }
+          }
+
+          // Resolve any still-missing parent folder definitions directly by ID (max 8 targeted searches)
+          const updatedIdSet = new Set(cached.foldersList.map(f => String(f.id)));
+          const stillMissing = Array.from(missingParents).filter(id => !updatedIdSet.has(id)).slice(0, 8);
+          for (const parentId of stillMissing) {
+            try {
+              const parentMsgs = await searchChannelMessages(client, peer, parentId, 1);
+              if (parentMsgs.length > 0) {
+                const { hasNewFolders } = parseMessagesIntoFilesAndFolders(
+                  channelIdStr,
+                  channelFolder.id,
+                  cached.foldersList,
+                  dummyFiles,
+                  parentMsgs,
+                );
+                if (hasNewFolders) lazyDirty = true;
+              }
+            } catch {}
+          }
+
+          console.info(
+            `[VFS LazySync] channel=${channelIdStr} total=${topInfo.totalCount} dirMsgs=${dirMsgs.length} folders=${cached.foldersList.length} missingParents=${missingParents.size}`,
+          );
         } catch (dirErr) {
           console.warn(`Lazy directory discovery skipped for channel ${channelIdStr}:`, dirErr);
         }
       }
 
-      // Fetch latest 200 messages once if channel hasn't been initialized yet (shows root/recent items immediately!)
-      if (cached.lastMessageId === 0 || (cached.files.length === 0 && (cached.foldersList?.length || 0) === 0)) {
+      // Guaranteed non-empty root: if channel has NO folders AND NO files locally (or hasn't been initialized yet),
+      // fetch the latest 200 messages so a 124,000-item channel NEVER displays "This folder is empty"!
+      const hasAnyLocalContent = (cached.foldersList?.length || 0) > 0 || cached.files.length > 0;
+      if (cached.lastMessageId === 0 || !hasAnyLocalContent) {
         let offsetId = 0;
         const burstBatch: any[] = [];
         for (let b = 0; b < INITIAL_BURST_PAGES; b++) {
@@ -1672,13 +1768,13 @@ export const syncChannelFiles = async (
           if (rootFiles.length > 0) {
             cached.files = dedupeCachedFiles([...cached.files, ...rootFiles]).slice(-300);
           } else if ((cached.foldersList?.length || 0) === 0 && parsedFiles.length > 0) {
-            // Flat 124k photo channel with NO subfolders: show latest 200 photos directly at root!
+            // Flat 124k photo channel or unindexed dir search: show latest 200 photos directly at root!
             cached.files = dedupeCachedFiles([...cached.files, ...parsedFiles]).slice(-300);
           }
           if (parsedFiles.length > 0) {
             await mergeDeltaFilesIntoLazyBuckets(channelIdStr, parsedFiles);
           }
-          if (hasNewFiles || hasNewFolders) lazyDirty = true;
+          if (hasNewFiles || hasNewFolders || cached.files.length > 0) lazyDirty = true;
         }
       }
 
@@ -1687,7 +1783,7 @@ export const syncChannelFiles = async (
         lazyDirty = true;
       }
 
-      if (lazyDirty || !cached.lastSyncedAt) {
+      if (lazyDirty || !cached.lastSyncedAt || (Object.keys(channelFolder.folders).length === 0 && channelFolder.files.length === 0)) {
         cached.lastValidation = Date.now();
         await flushToUiAndCache();
       }

@@ -5021,7 +5021,7 @@ export const DriveUI: React.FC = () => {
       try {
         await syncChannelFiles(client, targetToSync, filesMapRef.current, () => {
           syncFolderStack();
-        });
+        }, { refreshDirectories: isEmptyCurrently });
       } catch (err) {
         console.error("Failed to fetch messages for channel", err);
       } finally {
