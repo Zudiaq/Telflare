@@ -2487,8 +2487,11 @@ export const DriveUI: React.FC = () => {
   const [currentFolder, setCurrentFolder] = useState<VirtualFolder | null>(null);
   const [isSubfolderLoading, setIsSubfolderLoading] = useState(false);
   const FILE_RENDER_STEP = 120;
+  const FOLDER_RENDER_STEP = 120;
   const [visibleFileCount, setVisibleFileCount] = useState<number>(FILE_RENDER_STEP);
+  const [visibleFolderCount, setVisibleFolderCount] = useState<number>(FOLDER_RENDER_STEP);
   const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
+  const loadMoreFoldersSentinelRef = useRef<HTMLDivElement | null>(null);
   const lastVisibilitySyncRef = useRef<number>(0);
   const [pathStack, setPathStack] = useState<VirtualFolder[]>([]);
   const [loading, setLoading] = useState(false);
@@ -2897,11 +2900,25 @@ export const DriveUI: React.FC = () => {
     }
     
     if (targetChanFolder) {
+      if (targetChanFolder.isLazyChannel) {
+        const activeSub = pathStackRef.current[pathStackRef.current.length - 1];
+        void (async () => {
+          await syncChannelFiles(client, targetChanFolder!, filesMapRef.current, () => {
+            syncFolderStack();
+          }, { refreshDirectories: true });
+          if (activeSub && activeSub !== targetChanFolder && activeSub.folderId) {
+            await syncSubfolderOnDemand(client, targetChanFolder!, activeSub.folderId, filesMapRef.current, () => {
+              syncFolderStack();
+            }, { forceRefresh: true });
+          }
+        })();
+      } else {
         clearChannelCache(String(chanId)).then(() => {
            syncChannelFiles(client, targetChanFolder!, filesMapRef.current, () => {
               syncFolderStack();
            });
         });
+      }
     }
   }, [client, pathStack, zudRootChannelId]);
 
@@ -3197,7 +3214,7 @@ export const DriveUI: React.FC = () => {
       const root = pathStackRef.current[0];
       if (!root || cancelled) return;
       const partialChannels = Object.values(root.folders).filter(
-        (ch) => ch.historyComplete === false || ((ch.serverTotalCount || 0) > (ch.files.length + 100))
+        (ch) => ch.isLazyChannel === true || ch.historyComplete === false || ((ch.serverTotalCount || 0) > (ch.files.length + 100))
       );
       if (partialChannels.length === 0) return;
 
@@ -3381,9 +3398,10 @@ export const DriveUI: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, activeAccountId]);
 
-  // Reset windowed file count when switching folders, sort, or view mode (keeps 124k+ folders 60fps!)
+  // Reset windowed file & folder counts when switching folders, sort, or view mode (keeps 124k+ folders 60fps!)
   useEffect(() => {
     setVisibleFileCount(FILE_RENDER_STEP);
+    setVisibleFolderCount(FOLDER_RENDER_STEP);
   }, [currentFolder?.id, sortMode, sortOrder, viewMode]);
 
   // Progressive infinite scroll observer: appends +120 file cards seamlessly as user scrolls
@@ -3401,6 +3419,22 @@ export const DriveUI: React.FC = () => {
     obs.observe(sentinel);
     return () => obs.disconnect();
   }, [currentFolder?.id, currentFolder?.files?.length, visibleFileCount, viewMode]);
+
+  // Progressive infinite scroll observer for folders (keeps 2,000+ subfolders instant & zero-freeze!)
+  useEffect(() => {
+    const sentinel = loadMoreFoldersSentinelRef.current;
+    if (!sentinel || typeof IntersectionObserver === 'undefined') return;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setVisibleFolderCount((prev) => prev + FOLDER_RENDER_STEP);
+        }
+      },
+      { rootMargin: '1000px 0px' },
+    );
+    obs.observe(sentinel);
+    return () => obs.disconnect();
+  }, [currentFolder?.id, currentFolder ? Object.keys(currentFolder.folders).length : 0, visibleFolderCount, viewMode]);
 
   // Synchronously switch account state when activeAccountId changes
   useEffect(() => {
@@ -3764,6 +3798,14 @@ export const DriveUI: React.FC = () => {
          }
          setCurrentFolder(current);
          setPathStack(newStack);
+         if (current.folderId && current !== channelFolder && client && (channelFolder.isLazyChannel || current.files.length === 0)) {
+           if (current.files.length === 0 && Object.keys(current.folders).length === 0) {
+             setIsSubfolderLoading(true);
+           }
+           void syncSubfolderOnDemand(client, channelFolder, current.folderId, filesMapRef.current, () => {
+             syncFolderStack();
+           }).finally(() => setIsSubfolderLoading(false));
+         }
       } else {
          // It's a file. Traverse down to the parent folder
          for (let i = 1; i < parts.length - 1; i++) {
@@ -4965,7 +5007,7 @@ export const DriveUI: React.FC = () => {
         (isEmptyCurrently && (targetToSync.serverTotalCount || 0) > 0))
     );
 
-    if (folder.folderId && targetToSync && folder !== targetToSync && client && (targetToSync.historyComplete === false || isEmptyCurrently)) {
+    if (folder.folderId && targetToSync && folder !== targetToSync && client && (targetToSync.isLazyChannel || targetToSync.historyComplete === false || isEmptyCurrently)) {
       if (isEmptyCurrently) setIsSubfolderLoading(true);
       try {
         await syncSubfolderOnDemand(client, targetToSync, folder.folderId, filesMapRef.current, () => {
@@ -5155,16 +5197,22 @@ export const DriveUI: React.FC = () => {
     if (totalFiles > 0) {
       return <span>{fmt(totalFiles)} {totalFiles === 1 ? 'file' : 'files'}</span>;
     }
+    if (folder.isLazyChannel && folder.folderId && !folder.subfolderSynced) {
+      return <span className="text-blue-500/80 dark:text-blue-400/80">Cloud folder</span>;
+    }
     return <span>0 items</span>;
   };
 
   const renderFolderSection = (foldersList: VirtualFolder[]) => {
     if (foldersList.length === 0) return null;
+    const visibleFolders = foldersList.slice(0, visibleFolderCount);
     return (
       <section className="mb-8">
-        <h2 className="text-sm font-bold uppercase tracking-wider mb-4 text-gray-500 dark:text-gray-400">
-          Folders
-        </h2>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-sm font-bold uppercase tracking-wider text-gray-500 dark:text-gray-400">
+            Folders {foldersList.length > 0 ? `(${foldersList.length.toLocaleString()})` : ''}
+          </h2>
+        </div>
         
         {/* Grid View */}
         {viewMode === 'grid' && (
@@ -5175,7 +5223,7 @@ export const DriveUI: React.FC = () => {
               ? "grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-4 gap-4 sm:gap-6" 
               : "grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3 sm:gap-4"
           }>
-            {foldersList.map(folder => {
+            {visibleFolders.map(folder => {
               const isSelected = selectedItems.has(folder.id);
               const isCut = clipboard?.action === 'move' && clipboard.items.some(i => i.type === 'folder' && i.item.id === folder.id);
 
@@ -5247,7 +5295,7 @@ export const DriveUI: React.FC = () => {
               ? "grid grid-cols-1 sm:grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6 sm:gap-8"
               : "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 sm:gap-6"
           }>
-            {foldersList.map(folder => {
+            {visibleFolders.map(folder => {
               const isSelected = selectedItems.has(folder.id);
               const isCut = clipboard?.action === 'move' && clipboard.items.some(i => i.type === 'folder' && i.item.id === folder.id);
               return (
@@ -5304,7 +5352,7 @@ export const DriveUI: React.FC = () => {
         {/* List View */}
         {viewMode === 'list' && (
           <div className="flex flex-col gap-2">
-            {foldersList.map(folder => {
+            {visibleFolders.map(folder => {
               const isSelected = selectedItems.has(folder.id);
               const isCut = clipboard?.action === 'move' && clipboard.items.some(i => i.type === 'folder' && i.item.id === folder.id);
               return (
@@ -5357,6 +5405,23 @@ export const DriveUI: React.FC = () => {
                 </div>
               );
             })}
+          </div>
+        )}
+        {visibleFolderCount < foldersList.length && (
+          <div
+            ref={loadMoreFoldersSentinelRef}
+            className="mt-4 py-3 flex flex-col items-center justify-center gap-2 text-xs text-gray-400 dark:text-gray-500"
+          >
+            <span>
+              Showing {Math.min(visibleFolderCount, foldersList.length).toLocaleString()} of {foldersList.length.toLocaleString()} folders
+            </span>
+            <button
+              type="button"
+              onClick={() => setVisibleFolderCount((prev) => prev + FOLDER_RENDER_STEP)}
+              className="px-4 py-1.5 rounded-full bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-gray-700 dark:text-gray-200 font-medium transition-colors"
+            >
+              Load more folders
+            </button>
           </div>
         )}
       </section>
@@ -6716,6 +6781,7 @@ export const DriveUI: React.FC = () => {
               const activeIndexedCount = activeStats?.recursiveFileCount || 0;
               const isBackfillingNow = Boolean(
                 activeChannelNode &&
+                !activeChannelNode.isLazyChannel &&
                 (isChannelBackfilling(activeChanIdStr) ||
                   (activeChannelNode.historyComplete === false && activeServerTotal > activeIndexedCount))
               );
