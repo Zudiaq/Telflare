@@ -84,6 +84,14 @@ self.addEventListener('fetch', (event) => {
       event.respondWith(new Response(null, { status: 400 }));
       return;
     }
+    let parsedCover = null;
+    try {
+      parsedCover = new URL(targetUrl);
+    } catch (_e) {}
+    if (!parsedCover || parsedCover.protocol !== 'https:' || !/^[a-z0-9-]+\.mzstatic\.com$/.test(parsedCover.hostname.toLowerCase())) {
+      event.respondWith(new Response(null, { status: 403 }));
+      return;
+    }
     
     event.respondWith(
       (async () => {

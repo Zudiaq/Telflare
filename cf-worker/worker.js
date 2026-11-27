@@ -270,32 +270,77 @@ async function handleItunesSearch(url) {
   }
 }
 
+const ALLOWED_COVER_HOST_RE = /^[a-z0-9-]+\.mzstatic\.com$/;
+
+function isPrivateOrDisallowedHost(hostname) {
+  const h = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+  if (!h) return true;
+  if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".internal")) {
+    return true;
+  }
+  const ipv4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) return true;
+  if (h.includes(":")) return true;
+  return false;
+}
+
+function validateSafeCoverUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch (_) {
+    return null;
+  }
+  if (parsed.protocol !== "https:") return null;
+  if (parsed.username || parsed.password || parsed.port) return null;
+  const host = parsed.hostname.toLowerCase();
+  if (isPrivateOrDisallowedHost(host)) return null;
+  if (!ALLOWED_COVER_HOST_RE.test(host)) return null;
+  return "https://" + host + parsed.pathname + parsed.search;
+}
+
 async function handleCoverProxy(url) {
   const targetUrl = url.searchParams.get("url");
   if (!targetUrl) return new Response("Missing url param", { status: 400 });
+  const safeUrl = validateSafeCoverUrl(targetUrl);
+  if (!safeUrl) return new Response("Forbidden cover host", { status: 403 });
   try {
-    const parsed = new URL(targetUrl);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return new Response("Invalid protocol", { status: 400 });
+    let currentUrl = safeUrl;
+    let res = null;
+    for (let hop = 0; hop <= 2; hop++) {
+      res = await fetch(currentUrl, {
+        redirect: "manual",
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          Accept: "image/*,*/*;q=0.8",
+        },
+      });
+      if (res.status >= 300 && res.status < 400) {
+        const location = res.headers.get("location");
+        if (!location) return new Response("Invalid redirect", { status: 502 });
+        const nextUrl = validateSafeCoverUrl(new URL(location, currentUrl).toString());
+        if (!nextUrl) return new Response("Forbidden redirect target", { status: 403 });
+        currentUrl = nextUrl;
+        continue;
+      }
+      break;
     }
-    const res = await fetch(targetUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        Accept: "image/*,*/*;q=0.8",
-      },
-    });
-    if (!res.ok) return new Response("Cover fetch failed", { status: res.status });
+    if (!res || !res.ok) return new Response("Cover fetch failed", { status: res ? res.status : 502 });
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.toLowerCase().startsWith("image/")) {
+      return new Response("Unsupported cover media type", { status: 415 });
+    }
     const headers = new Headers();
-    headers.set("Content-Type", res.headers.get("content-type") || "image/jpeg");
+    headers.set("Content-Type", contentType);
+    headers.set("X-Content-Type-Options", "nosniff");
     headers.set("Cache-Control", "public, max-age=31536000, immutable");
     headers.set("Access-Control-Allow-Origin", "*");
     headers.set("Cross-Origin-Resource-Policy", "cross-origin");
     return new Response(res.body, { status: 200, headers });
-  } catch (err) {
-    return new Response(String(err), { status: 502 });
+  } catch (_err) {
+    return new Response("Cover proxy error", { status: 502 });
   }
 }
-
 async function handleFfmpegProxy(pathname) {
   const filename = pathname.replace(/^\/api\/ffmpeg\//, "");
   if (!/^(ffmpeg-core\.(js|wasm))$/.test(filename)) {
