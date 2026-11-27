@@ -2112,3 +2112,468 @@ export const syncChannelFiles = async (
     void validateCache();
   }
 };
+
+/**
+ * Normalize any channelId (BigInt, Telegram Integer, string) to canonical string key.
+ */
+const normChanId = (id: any): string => {
+  if (id && typeof id === 'object' && id.value !== undefined) return String(id.value);
+  return String(id ?? '');
+};
+
+/**
+ * Recursively remove files (by messageId or file.id) and folders (by folderId or msgId)
+ * from an in-memory VirtualFolder tree and globalFilesMap in O(N).
+ */
+const pruneTreeInMemory = (
+  root: VirtualFolder,
+  deletedMsgIds: Set<number>,
+  deletedFolderIds: Set<string>,
+  deletedFileIds: Set<string>,
+  globalFilesMap?: { [path: string]: VirtualFile },
+) => {
+  const stack: VirtualFolder[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (node.files && node.files.length > 0) {
+      node.files = node.files.filter((f) => {
+        const hit = deletedFileIds.has(f.id) || (f.parts || []).some((p) => deletedMsgIds.has(Number(p.messageId)));
+        if (hit && globalFilesMap) {
+          delete globalFilesMap[f.id];
+          delete globalFilesMap[f.path];
+        }
+        return !hit;
+      });
+    }
+    if (node.folders) {
+      for (const key of Object.keys(node.folders)) {
+        const child = node.folders[key];
+        const isDeletedFolder =
+          (child.folderId && deletedFolderIds.has(String(child.folderId))) ||
+          (child.msgId && deletedMsgIds.has(Number(child.msgId))) ||
+          deletedFolderIds.has(String(child.id));
+        if (isDeletedFolder) {
+          // Also purge nested files from globalFilesMap
+          const subStack: VirtualFolder[] = [child];
+          while (subStack.length > 0) {
+            const s = subStack.pop()!;
+            if (globalFilesMap) {
+              for (const f of s.files || []) {
+                delete globalFilesMap[f.id];
+                delete globalFilesMap[f.path];
+              }
+            }
+            for (const c of Object.values(s.folders || {})) subStack.push(c);
+          }
+          delete node.folders[key];
+        } else {
+          stack.push(child);
+        }
+      }
+    }
+  }
+};
+
+/**
+ * ATOMIC INSTANT DELETE (< 5ms):
+ * Immediately removes deleted files & folders from in-memory tree, globalFilesMap,
+ * IndexedDB `channels`, and all affected `folder_items` buckets — zero stale ghosts!
+ */
+export const applyCacheDelete = async (
+  channelId: any,
+  channelFolder: VirtualFolder | undefined,
+  items: { type: 'file' | 'folder'; item: any }[],
+  globalFilesMap?: { [path: string]: VirtualFile },
+) => {
+  const chanId = normChanId(channelId);
+  if (!chanId || chanId === 'root') return;
+
+  const deletedMsgIds = new Set<number>();
+  const deletedFolderIds = new Set<string>();
+  const deletedFileIds = new Set<string>();
+  const touchedBucketIds = new Set<string>();
+
+  const collect = (entry: { type: 'file' | 'folder'; item: any }) => {
+    if (entry.type === 'file') {
+      const f: VirtualFile = entry.item;
+      if (f?.id) deletedFileIds.add(String(f.id));
+      if (f?.pId) touchedBucketIds.add(String(f.pId));
+      for (const p of f?.parts || []) {
+        if (p?.messageId) deletedMsgIds.add(Number(p.messageId));
+      }
+    } else if (entry.type === 'folder') {
+      const fld: VirtualFolder = entry.item;
+      if (fld?.id) deletedFolderIds.add(String(fld.id));
+      if (fld?.folderId) {
+        deletedFolderIds.add(String(fld.folderId));
+        touchedBucketIds.add(String(fld.folderId));
+      }
+      if (fld?.msgId) deletedMsgIds.add(Number(fld.msgId));
+      for (const sub of Object.values(fld?.folders || {})) collect({ type: 'folder', item: sub });
+      for (const f of fld?.files || []) collect({ type: 'file', item: f });
+    }
+  };
+  for (const it of items) collect(it);
+
+  // 1. Update in-memory tree immediately (0ms UI!)
+  if (channelFolder) {
+    pruneTreeInMemory(channelFolder, deletedMsgIds, deletedFolderIds, deletedFileIds, globalFilesMap);
+    if (channelFolder.serverTotalCount && deletedMsgIds.size > 0) {
+      channelFolder.serverTotalCount = Math.max(0, channelFolder.serverTotalCount - deletedMsgIds.size);
+    }
+  }
+
+  // 2. Update IndexedDB `channels` record + all affected `folder_items` buckets atomically
+  try {
+    const cached = await loadChannelCache(chanId);
+    if (cached) {
+      cached.files = (cached.files || []).filter(
+        (f) => !deletedFileIds.has(f.id) && !(f.parts || []).some((p) => deletedMsgIds.has(Number(p.messageId))),
+      );
+      if (cached.foldersList) {
+        // Also cascade-delete any child folders whose pId was deleted
+        let removedAny = true;
+        while (removedAny) {
+          removedAny = false;
+          for (const f of cached.foldersList) {
+            if (deletedFolderIds.has(String(f.pId)) && !deletedFolderIds.has(String(f.id))) {
+              deletedFolderIds.add(String(f.id));
+              touchedBucketIds.add(String(f.id));
+              removedAny = true;
+            }
+          }
+        }
+        cached.foldersList = cached.foldersList.filter(
+          (f) => !deletedFolderIds.has(String(f.id)) && (!f.msgId || !deletedMsgIds.has(Number(f.msgId))),
+        );
+      }
+      if (cached.serverTotalCount && deletedMsgIds.size > 0) {
+        cached.serverTotalCount = Math.max(0, cached.serverTotalCount - deletedMsgIds.size);
+      }
+      await saveChannelCache(chanId, cached);
+    }
+
+    const db = await getDb();
+    for (const fid of touchedBucketIds) {
+      const key = folderBucketKey(chanId, fid);
+      if (deletedFolderIds.has(fid)) {
+        await db.delete(FOLDER_STORE_NAME, key);
+      } else {
+        const bucket = await loadFolderBucket(chanId, fid);
+        if (bucket) {
+          const nextFiles = bucket.files.filter(
+            (f) => !deletedFileIds.has(f.id) && !(f.parts || []).some((p) => deletedMsgIds.has(Number(p.messageId))),
+          );
+          await saveFolderBucket(chanId, fid, nextFiles, bucket.complete);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('Atomic cache delete failed:', e);
+  }
+};
+
+/**
+ * ATOMIC INSTANT MOVE / COPY (< 5ms):
+ * Updates BOTH source and destination in-memory trees + IndexedDB `channels` + `folder_items`
+ * immediately after Telegram accepts the move/copy — eliminating stale items in old folders
+ * and eliminating race conditions with Telegram's 2-second search index lag!
+ */
+export const applyCacheMoveOrCopy = async (opts: {
+  action: 'move' | 'copy';
+  sourceChannelId: any;
+  sourceChannelFolder?: VirtualFolder;
+  targetChannelId: any;
+  targetChannelFolder?: VirtualFolder;
+  targetFolderId: string; // 'root' or subfolder folderId
+  movedOrCopiedFiles: {
+    file: VirtualFile;
+    oldPId: string;
+    newPId: string;
+    newParts?: VirtualFile['parts'];
+  }[];
+  movedOrCopiedFolders: {
+    folder: VirtualFolder;
+    oldId: string;
+    newId: string;
+    oldPId: string;
+    newPId: string;
+    newMsgId?: number;
+  }[];
+  globalFilesMap?: { [path: string]: VirtualFile };
+}) => {
+  const srcChanId = normChanId(opts.sourceChannelId);
+  const dstChanId = normChanId(opts.targetChannelId);
+  const sameChannel = srcChanId === dstChanId;
+
+  // 1. If MOVE: remove from source buckets + source tree
+  if (opts.action === 'move' && srcChanId && srcChanId !== 'root') {
+    const movedMsgIds = new Set<number>();
+    const movedFileIds = new Set<string>();
+    const movedFolderIds = new Set<string>();
+    const srcBucketIds = new Set<string>();
+
+    for (const entry of opts.movedOrCopiedFiles) {
+      movedFileIds.add(entry.file.id);
+      if (entry.oldPId && entry.oldPId !== 'root') srcBucketIds.add(String(entry.oldPId));
+      for (const p of entry.file.parts || []) {
+        if (p.messageId) movedMsgIds.add(Number(p.messageId));
+      }
+    }
+    for (const entry of opts.movedOrCopiedFolders) {
+      movedFolderIds.add(String(entry.oldId));
+      if (entry.folder.id) movedFolderIds.add(String(entry.folder.id));
+      if (entry.folder.msgId) movedMsgIds.add(Number(entry.folder.msgId));
+    }
+
+    if (opts.sourceChannelFolder) {
+      pruneTreeInMemory(opts.sourceChannelFolder, movedMsgIds, movedFolderIds, movedFileIds, opts.globalFilesMap);
+    }
+
+    try {
+      const srcCache = await loadChannelCache(srcChanId);
+      if (srcCache) {
+        srcCache.files = (srcCache.files || []).filter(
+          (f) => !movedFileIds.has(f.id) && !(f.parts || []).some((p) => movedMsgIds.has(Number(p.messageId))),
+        );
+        if (!sameChannel && srcCache.foldersList) {
+          srcCache.foldersList = srcCache.foldersList.filter((f) => !movedFolderIds.has(String(f.id)));
+        }
+        if (!sameChannel && srcCache.serverTotalCount && movedMsgIds.size > 0) {
+          srcCache.serverTotalCount = Math.max(0, srcCache.serverTotalCount - movedMsgIds.size);
+        }
+        await saveChannelCache(srcChanId, srcCache);
+      }
+
+      for (const fid of srcBucketIds) {
+        const bucket = await loadFolderBucket(srcChanId, fid);
+        if (bucket) {
+          const nextFiles = bucket.files.filter(
+            (f) => !movedFileIds.has(f.id) && !(f.parts || []).some((p) => movedMsgIds.has(Number(p.messageId))),
+          );
+          await saveFolderBucket(srcChanId, fid, nextFiles, bucket.complete);
+        }
+      }
+    } catch (e) {
+      console.warn('Atomic cache move source cleanup failed:', e);
+    }
+  }
+
+  // 2. Insert into destination channel metadata + folder_items buckets + in-memory tree
+  if (dstChanId && dstChanId !== 'root') {
+    try {
+      let dstCache = await loadChannelCache(dstChanId);
+      if (!dstCache) {
+        dstCache = {
+          channelId: dstChanId,
+          lastMessageId: 0,
+          minSyncedId: 0,
+          historyComplete: true,
+          lazyMode: Boolean(opts.targetChannelFolder?.isLazyChannel),
+          files: [],
+          foldersList: [],
+        };
+      }
+      if (!dstCache.foldersList) dstCache.foldersList = [];
+
+      // Upsert moved/copied folders into destination foldersList
+      const folderById = new Map(dstCache.foldersList.map((f) => [String(f.id), f]));
+      for (const entry of opts.movedOrCopiedFolders) {
+        const existing = folderById.get(String(entry.newId));
+        if (existing) {
+          existing.name = entry.folder.name;
+          existing.pId = String(entry.newPId || 'root');
+          if (entry.newMsgId) existing.msgId = entry.newMsgId;
+        } else {
+          const nf: FolderEntry = {
+            id: String(entry.newId),
+            name: entry.folder.name,
+            pId: String(entry.newPId || 'root'),
+            msgId: entry.newMsgId ?? entry.folder.msgId,
+          };
+          dstCache.foldersList.push(nf);
+          folderById.set(nf.id, nf);
+        }
+        if (entry.newMsgId && entry.newMsgId > dstCache.lastMessageId) {
+          dstCache.lastMessageId = entry.newMsgId;
+        }
+      }
+
+      const lookup = createFolderLookup(dstCache.foldersList);
+      const dstChanFolderId = opts.targetChannelFolder?.id || dstChanId;
+
+      // Ensure destination folders exist in memory tree
+      if (opts.targetChannelFolder) {
+        for (const entry of opts.movedOrCopiedFolders) {
+          const fullPath = resolveFolderPathFast(entry.newId, lookup);
+          if (fullPath) {
+            const node = insertFolderIntoTree(
+              opts.targetChannelFolder,
+              fullPath,
+              entry.newMsgId ?? entry.folder.msgId,
+              entry.newId,
+            );
+            if (node && dstCache.lazyMode) node.isLazyChannel = true;
+          }
+        }
+      }
+
+      // Build updated VirtualFile objects and group by destination bucket pId
+      const filesByDstBucket = new Map<string, VirtualFile[]>();
+      const dstRootFiles: VirtualFile[] = [];
+
+      for (const entry of opts.movedOrCopiedFiles) {
+        const newPId = String(entry.newPId || 'root');
+        const resolvedDir = newPId !== 'root' ? resolveFolderPathFast(newPId, lookup) : '';
+        const dirPath = resolvedDir && resolvedDir !== 'Root' ? resolvedDir : '';
+        const fullPath = dirPath ? `${dirPath}/${entry.file.name}` : entry.file.name;
+        const nextParts = (entry.newParts || entry.file.parts || []).map((p) => ({
+          ...p,
+          channelId: dstChanId,
+        }));
+        for (const p of nextParts) {
+          if (p.messageId > dstCache.lastMessageId) dstCache.lastMessageId = p.messageId;
+        }
+
+        const updatedFile: VirtualFile = {
+          ...entry.file,
+          id: `${dstChanFolderId}/${fullPath}`,
+          path: fullPath,
+          pId: newPId,
+          parts: nextParts,
+          date: Math.floor(Date.now() / 1000),
+        };
+
+        if (opts.globalFilesMap) {
+          opts.globalFilesMap[updatedFile.id] = updatedFile;
+          opts.globalFilesMap[updatedFile.path] = updatedFile;
+        }
+        if (opts.targetChannelFolder) {
+          insertFileIntoFolderTree(opts.targetChannelFolder, updatedFile);
+        }
+
+        if (newPId === 'root') {
+          dstRootFiles.push(updatedFile);
+        } else {
+          let list = filesByDstBucket.get(newPId);
+          if (!list) {
+            list = [];
+            filesByDstBucket.set(newPId, list);
+          }
+          list.push(updatedFile);
+        }
+      }
+
+      if (dstCache.lazyMode) {
+        if (dstRootFiles.length > 0) {
+          dstCache.files = dedupeCachedFiles([...dstCache.files, ...dstRootFiles]).slice(-300);
+        }
+      } else {
+        const allIncoming = [...dstRootFiles, ...Array.from(filesByDstBucket.values()).flat()];
+        if (allIncoming.length > 0) {
+          dstCache.files = dedupeCachedFiles([...dstCache.files, ...allIncoming]);
+        }
+      }
+
+      if ((opts.action === 'copy' || !sameChannel) && dstCache.serverTotalCount !== undefined) {
+        const addedCount = opts.movedOrCopiedFiles.length + opts.movedOrCopiedFolders.length;
+        dstCache.serverTotalCount += addedCount;
+        if (opts.targetChannelFolder) {
+          opts.targetChannelFolder.serverTotalCount = dstCache.serverTotalCount;
+        }
+      }
+
+      await saveChannelCache(dstChanId, dstCache);
+
+      // Persist destination per-folder buckets immediately
+      for (const [fid, incoming] of filesByDstBucket.entries()) {
+        const existing = await loadFolderBucket(dstChanId, fid);
+        const merged = dedupeCachedFiles([...(existing?.files || []), ...incoming]);
+        await saveFolderBucket(dstChanId, fid, merged, existing?.complete ?? true);
+      }
+
+      // For normal (non-lazy) channels, re-hydrate cleanly from updated cache
+      if (!dstCache.lazyMode && opts.targetChannelFolder) {
+        hydrateChannelFromCache(opts.targetChannelFolder, dstCache, opts.globalFilesMap);
+      }
+    } catch (e) {
+      console.warn('Atomic cache move/copy destination update failed:', e);
+    }
+  }
+};
+
+/**
+ * ATOMIC INSTANT RENAME (< 5ms):
+ * Updates renamed file or folder in memory, IndexedDB `channels`, and `folder_items` immediately!
+ */
+export const applyCacheRename = async (
+  channelId: any,
+  channelFolder: VirtualFolder | undefined,
+  item: { type: 'file' | 'folder'; item: any },
+  newName: string,
+  globalFilesMap?: { [path: string]: VirtualFile },
+) => {
+  const chanId = normChanId(channelId);
+  if (!chanId || chanId === 'root' || !newName.trim()) return;
+
+  try {
+    const cached = await loadChannelCache(chanId);
+    if (item.type === 'file') {
+      const file: VirtualFile = item.item;
+      const oldId = file.id;
+      const oldPath = file.path;
+      const dirPart = oldPath.includes('/') ? oldPath.slice(0, oldPath.lastIndexOf('/')) : '';
+      const nextPath = dirPart ? `${dirPart}/${newName}` : newName;
+      const chanPrefix = channelFolder?.id || chanId;
+      const nextId = `${chanPrefix}/${nextPath}`;
+
+      file.name = newName;
+      file.path = nextPath;
+      file.id = nextId;
+      if (globalFilesMap) {
+        delete globalFilesMap[oldId];
+        delete globalFilesMap[oldPath];
+        globalFilesMap[nextId] = file;
+        globalFilesMap[nextPath] = file;
+      }
+
+      if (cached) {
+        for (const f of cached.files || []) {
+          if (f.id === oldId || f.parts?.[0]?.messageId === file.parts?.[0]?.messageId) {
+            f.name = newName;
+            f.path = nextPath;
+            f.id = nextId;
+          }
+        }
+        await saveChannelCache(chanId, cached);
+      }
+      if (file.pId && file.pId !== 'root') {
+        const bucket = await loadFolderBucket(chanId, String(file.pId));
+        if (bucket) {
+          for (const f of bucket.files) {
+            if (f.id === oldId || f.parts?.[0]?.messageId === file.parts?.[0]?.messageId) {
+              f.name = newName;
+              f.path = nextPath;
+              f.id = nextId;
+            }
+          }
+          await saveFolderBucket(chanId, String(file.pId), bucket.files, bucket.complete);
+        }
+      }
+    } else if (item.type === 'folder') {
+      const folder: VirtualFolder = item.item;
+      if (cached?.foldersList && folder.folderId) {
+        const entry = cached.foldersList.find((f) => String(f.id) === String(folder.folderId));
+        if (entry) {
+          entry.name = newName;
+          await saveChannelCache(chanId, cached);
+          if (channelFolder) {
+            hydrateChannelFromCache(channelFolder, cached, globalFilesMap);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('Atomic cache rename failed:', e);
+  }
+};

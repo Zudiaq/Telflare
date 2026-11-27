@@ -45,7 +45,58 @@ const floodWaitSeconds = (error: any): number => {
   return getFloodWaitSeconds(error);
 };
 
-export const useDriveOperations = (rawClient: any, zudRootChannelId: string | null, onComplete: (affectedChannels: Set<string>, deletedChannels?: Set<string>) => void) => {
+const extractSentMsgId = (res: any): number | undefined => {
+  if (!res) return undefined;
+  if (typeof res.id === 'number') return res.id;
+  const updates = Array.isArray(res.updates) ? res.updates : [];
+  for (const u of updates) {
+    if (u?.message && typeof u.message.id === 'number') return u.message.id;
+    if (typeof u?.id === 'number') return u.id;
+  }
+  if (Array.isArray(res.messages) && typeof res.messages[0]?.id === 'number') {
+    return res.messages[0].id;
+  }
+  return undefined;
+};
+
+export type DriveMutationSummary =
+  | {
+      type: 'move' | 'copy';
+      sourceChannelId: string;
+      targetChannelId: string;
+      targetFolderId: string;
+      movedOrCopiedFiles: {
+        file: VirtualFile;
+        oldPId: string;
+        newPId: string;
+        newParts?: VirtualFile['parts'];
+      }[];
+      movedOrCopiedFolders: {
+        folder: VirtualFolder;
+        oldId: string;
+        newId: string;
+        oldPId: string;
+        newPId: string;
+        newMsgId?: number;
+      }[];
+    }
+  | {
+      type: 'delete';
+      items: { type: 'file' | 'folder'; item: any }[];
+    }
+  | {
+      type: 'rename';
+      channelId: string;
+      item: { type: 'file' | 'folder'; item: any };
+      newName: string;
+      isRootChannelRename?: boolean;
+    };
+
+export const useDriveOperations = (
+  rawClient: any,
+  zudRootChannelId: string | null,
+  onComplete: (affectedChannels: Set<string>, deletedChannels?: Set<string>, mutation?: DriveMutationSummary) => void
+) => {
   const client = rawClient
     ? new Proxy(rawClient, {
         get(_target, property) {
@@ -182,7 +233,7 @@ export const useDriveOperations = (rawClient: any, zudRootChannelId: string | nu
     setTimeout(() => {
       setOperations(prev => prev.filter(o => o.id !== opId || o.status === 'running'));
     }, 4500);
-    onComplete(affectedChannels, channelsToDelete);
+    onComplete(affectedChannels, channelsToDelete, { type: 'delete', items });
   }, [client, onComplete]);
 
   const pasteItems = useCallback(async (
@@ -230,6 +281,30 @@ export const useDriveOperations = (rawClient: any, zudRootChannelId: string | nu
       let done = 0;
       let failures = 0;
       const affectedChannels = new Set<string>();
+      const mutationFiles: {
+        file: VirtualFile;
+        oldPId: string;
+        newPId: string;
+        newParts?: VirtualFile['parts'];
+      }[] = [];
+      const mutationFolders: {
+        folder: VirtualFolder;
+        oldId: string;
+        newId: string;
+        oldPId: string;
+        newPId: string;
+        newMsgId?: number;
+      }[] = [];
+      const primarySourceChannelKey =
+        (files[0]?.parts?.[0]?.channelId ? channelKey(files[0].parts[0].channelId) : '') ||
+        (folders[0]?.channelId ? channelKey(folders[0].channelId) : '');
+      const resolvedTargetChanKey = channelKey(
+        targetFolder.channelId || (targetFolder.id === 'root' ? zudRootChannelId : 'me') || 'me'
+      );
+      const resolvedTargetFolderId =
+        targetFolder.id === 'root' || targetFolder.id === resolvedTargetChanKey
+          ? 'root'
+          : (targetFolder.folderId || 'root');
       
       const newFolderIds = new Map<string, string>();
       if (action === 'copy') {
@@ -254,12 +329,13 @@ export const useDriveOperations = (rawClient: any, zudRootChannelId: string | nu
           const message = `📁 Directory:** \`${metadata.n || folder.name}\`\n\n\`${metadataJson}\``;
           const randomId = bigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)) as any;
           try {
+            let sentDirRes: any = null;
             while (true) {
               try {
                 const targetPeer = await requestWithFloodRetry(() =>
                   resolvePeer(client, targetFolder.channelId || (targetFolder.id === 'root' ? zudRootChannelId : 'me') || 'me')
                 );
-                await requestWithFloodRetry(() => client.invoke(new Api.messages.SendMessage({
+                sentDirRes = await requestWithFloodRetry(() => client.invoke(new Api.messages.SendMessage({
                   peer: targetPeer,
                   message,
                   randomId
@@ -271,6 +347,15 @@ export const useDriveOperations = (rawClient: any, zudRootChannelId: string | nu
                 await options?.onFloodWait?.(waitSeconds);
               }
             }
+            mutationFolders.push({
+              folder,
+              oldId: String(folder.folderId || folder.id),
+              newId: String(metadata.id || folder.folderId || folder.id),
+              oldPId: String(metadata.pId || 'root'),
+              newPId: String(metadata.pId || 'root'),
+              newMsgId: extractSentMsgId(sentDirRes),
+            });
+            affectedChannels.add(resolvedTargetChanKey);
             done += 1;
             const currentPct = Math.min(99, 45 + Math.round((done / totalItems) * 55));
             if (!options?.suppressOperation) {
@@ -460,6 +545,11 @@ export const useDriveOperations = (rawClient: any, zudRootChannelId: string | nu
           }
           
           const partsToProcess = isFile ? fileOrFolder.parts : [{ channelId: fileOrFolder.channelId, messageId: fileOrFolder.msgId }];
+          const newPartsCollected: VirtualFile['parts'] = [];
+          let lastOldPId = String(fileOrFolder.pId || 'root');
+          let lastNewPId = resolvedTargetFolderId;
+          let lastFolderNewId = String(fileOrFolder.folderId || fileOrFolder.id);
+          let lastFolderNewMsgId: number | undefined = fileOrFolder.msgId;
           
           for (const p of partsToProcess) {
              const chan = p.channelId || 'me';
@@ -514,6 +604,7 @@ export const useDriveOperations = (rawClient: any, zudRootChannelId: string | nu
              }
              
              // Update Metadata
+             lastOldPId = String(meta.pId || fileOrFolder.pId || 'root');
              meta.n = meta.n || meta.f;
              delete meta.path; // legacy
              
@@ -539,6 +630,8 @@ export const useDriveOperations = (rawClient: any, zudRootChannelId: string | nu
              if (action === 'copy' && meta.t === 'dir' && mappedFolderId) {
                  meta.id = mappedFolderId;
              }
+             lastNewPId = String(meta.pId || 'root');
+             if (!isFile && meta.id) lastFolderNewId = String(meta.id);
              
              const fileName = meta.n || meta.f || 'Unknown';
              const newCaption = buildTelegramCaption(fileName, meta);
@@ -568,22 +661,34 @@ export const useDriveOperations = (rawClient: any, zudRootChannelId: string | nu
                        id: p.messageId,
                        message: newCaption
                     })));
+                    if (isFile) {
+                      newPartsCollected.push({ ...p, channelId: targetChannelKey });
+                    } else {
+                      lastFolderNewMsgId = p.messageId;
+                    }
                 } else {
                     // Different channel, send media to new channel and delete from old
                     const targetPeer = await requestWithFloodRetry(() => resolvePeer(client, targetChan));
+                    let sentRes: any = null;
                     if (msg?.media) {
-                       await requestWithFloodRetry(() => client.invoke(new Api.messages.SendMedia({
+                       sentRes = await requestWithFloodRetry(() => client.invoke(new Api.messages.SendMedia({
                           peer: targetPeer,
                           media: msg.media,
                           message: newCaption,
                           randomId: randomId
                        })));
                     } else {
-                       await requestWithFloodRetry(() => client.invoke(new Api.messages.SendMessage({
+                       sentRes = await requestWithFloodRetry(() => client.invoke(new Api.messages.SendMessage({
                           peer: targetPeer,
                           message: newCaption,
                           randomId: randomId
                        })));
+                    }
+                    const newMsgId = extractSentMsgId(sentRes);
+                    if (isFile) {
+                      newPartsCollected.push({ ...p, messageId: newMsgId ?? p.messageId, channelId: targetChannelKey });
+                    } else if (newMsgId) {
+                      lastFolderNewMsgId = newMsgId;
                     }
                     if (sourceChannelKey === 'me') {
                         await requestWithFloodRetry(() => client.invoke(new Api.messages.DeleteMessages({
@@ -600,22 +705,45 @@ export const useDriveOperations = (rawClient: any, zudRootChannelId: string | nu
                 }
              } else if (action === 'copy') {
                 const targetPeer = await requestWithFloodRetry(() => resolvePeer(client, targetChan));
-                
+                let sentRes: any = null;
                 if (msg?.media) {
-                   await requestWithFloodRetry(() => client.invoke(new Api.messages.SendMedia({
+                   sentRes = await requestWithFloodRetry(() => client.invoke(new Api.messages.SendMedia({
                       peer: targetPeer,
                       media: msg.media,
                       message: newCaption,
                       randomId: randomId
                    })));
                 } else {
-                   await requestWithFloodRetry(() => client.invoke(new Api.messages.SendMessage({
+                   sentRes = await requestWithFloodRetry(() => client.invoke(new Api.messages.SendMessage({
                       peer: targetPeer,
                       message: newCaption,
                       randomId: randomId
                    })));
                 }
+                const newMsgId = extractSentMsgId(sentRes);
+                if (isFile) {
+                  newPartsCollected.push({ ...p, messageId: newMsgId ?? p.messageId, channelId: targetChannelKey });
+                } else if (newMsgId) {
+                  lastFolderNewMsgId = newMsgId;
+                }
              }
+          }
+          if (isFile && newPartsCollected.length > 0) {
+            mutationFiles.push({
+              file: fileOrFolder,
+              oldPId: lastOldPId,
+              newPId: lastNewPId,
+              newParts: newPartsCollected,
+            });
+          } else if (!isFile) {
+            mutationFolders.push({
+              folder: fileOrFolder,
+              oldId: String(fileOrFolder.folderId || fileOrFolder.id),
+              newId: lastFolderNewId,
+              oldPId: lastOldPId,
+              newPId: lastNewPId,
+              newMsgId: lastFolderNewMsgId,
+            });
           }
       } catch (e) {
         console.error(`Failed to ${action} file`, e);
@@ -652,7 +780,14 @@ export const useDriveOperations = (rawClient: any, zudRootChannelId: string | nu
         setOperations(prev => prev.filter(o => o.id !== opId || o.status === 'running'));
       }, 4500);
     }
-    onComplete(affectedChannels);
+    onComplete(affectedChannels, undefined, {
+      type: action,
+      sourceChannelId: primarySourceChannelKey || resolvedTargetChanKey,
+      targetChannelId: resolvedTargetChanKey,
+      targetFolderId: resolvedTargetFolderId,
+      movedOrCopiedFiles: mutationFiles,
+      movedOrCopiedFolders: mutationFolders,
+    });
     return failures === 0;
   }, [client, onComplete, zudRootChannelId]);
 
@@ -699,7 +834,12 @@ export const useDriveOperations = (rawClient: any, zudRootChannelId: string | nu
               message: newCaption
            }));
         }
-        onComplete(affectedChannels);
+        onComplete(affectedChannels, undefined, {
+          type: 'rename',
+          channelId: Array.from(affectedChannels)[0] || '',
+          item,
+          newName,
+        });
         return true;
       } else {
         const folder = item.item;
@@ -711,7 +851,13 @@ export const useDriveOperations = (rawClient: any, zudRootChannelId: string | nu
               title: newName
            }));
            affectedChannels.add(String(folder.channelId));
-           onComplete(affectedChannels);
+           onComplete(affectedChannels, undefined, {
+             type: 'rename',
+             channelId: String(folder.channelId),
+             item,
+             newName,
+             isRootChannelRename: true,
+           });
            return true;
         } else if (folder.msgId) {
            // Virtual Folder Rename
@@ -733,7 +879,12 @@ export const useDriveOperations = (rawClient: any, zudRootChannelId: string | nu
                   }));
                }
            }
-           onComplete(affectedChannels);
+           onComplete(affectedChannels, undefined, {
+             type: 'rename',
+             channelId: String(chan),
+             item,
+             newName,
+           });
            return true;
         }
         return false;

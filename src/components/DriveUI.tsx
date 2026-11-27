@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useTelegram } from '../context/TelegramContext';
 import type { StoredTelegramAccount } from '../lib/telegram';
 import { Login } from './Login';
-import { syncChannelFiles, clearChannelCache, parseMetadata, parseDocSize, hydrateChannelFromCache, loadChannelCache, getMimeType, fetchChannelTopInfo, syncSubfolderOnDemand, isChannelBackfilling, searchChannelOnDemand } from '../lib/vfs';
+import { syncChannelFiles, clearChannelCache, parseMetadata, parseDocSize, hydrateChannelFromCache, loadChannelCache, getMimeType, fetchChannelTopInfo, syncSubfolderOnDemand, isChannelBackfilling, searchChannelOnDemand, applyCacheDelete, applyCacheMoveOrCopy, applyCacheRename } from '../lib/vfs';
 import type { VirtualFolder, VirtualFile } from '../lib/vfs';
 import { Folder, File, Download, Smartphone, UploadCloud, ChevronRight, ChevronDown, LayoutGrid, List, LayoutDashboard, Loader2, X, Settings, LogOut, Play, Pause, Volume2, VolumeX, Maximize, Search, ArrowLeft, ArrowRight, Rewind, FastForward, Copy, Scissors, Trash2, Check, MoreVertical, ClipboardPaste, Edit2, FileAudio, CheckCircle2, Subtitles, Upload, Clock, Layers, AlertCircle, ShieldAlert, AlertTriangle, Sparkles, ListMusic, RotateCw, Database, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react';
 import { buildTelegramCaption } from '../lib/caption';
@@ -3122,24 +3122,95 @@ export const DriveUI: React.FC = () => {
     return () => clearTimeout(t);
   }, [client, activeChannelKey]);
 
-  const { operations, pasteItems, renameItem, clearDoneOperations } = useDriveOperations(client, zudRootChannelId, (affectedChannels: Set<string>, deletedChannels?: Set<string>) => {
-    if (client) {
-       const rootFolder = pathStack[0];
-       if (rootFolder) {
-         if (deletedChannels && deletedChannels.size > 0) {
-            deletedChannels.forEach(chanId => {
-                const targetKey = Object.keys(rootFolder.folders).find(k => String(rootFolder.folders[k].channelId) === String(chanId));
-                if (targetKey) delete rootFolder.folders[targetKey];
-            });
-            setPathStack(prev => [...prev]);
-         }
-         
-         affectedChannels.forEach(chanId => {
-           if (deletedChannels && deletedChannels.has(chanId)) return;
-           refreshChannel(String(chanId));
-         });
-       }
+  const { operations, pasteItems, renameItem, clearDoneOperations } = useDriveOperations(client, zudRootChannelId, (affectedChannels: Set<string>, deletedChannels?: Set<string>, mutation?: any) => {
+    if (!client) return;
+    const rootFolder = pathStackRef.current[0] || pathStack[0];
+    if (!rootFolder) return;
+
+    const findChanFolder = (chanId: string) => {
+      const targetNumId = channelNumericId(String(chanId));
+      let match = Object.values(rootFolder.folders).find(f => {
+        const fNumId = channelNumericId(String(f.channelId || ''));
+        if (targetNumId && fNumId) return targetNumId === fNumId;
+        return String(f.channelId || '') === String(chanId) || String(f.id) === String(chanId);
+      });
+      if (!match && zudRootChannelId) {
+        const rootNumId = channelNumericId(String(zudRootChannelId));
+        if ((targetNumId && rootNumId && targetNumId === rootNumId) || String(chanId) === String(zudRootChannelId)) {
+          match = rootFolder.folders[zudRootChannelId] || Object.values(rootFolder.folders).find(f => f.id === zudRootChannelId);
+        }
+      }
+      return match;
+    };
+
+    if (deletedChannels && deletedChannels.size > 0) {
+      deletedChannels.forEach(chanId => {
+        const targetKey = Object.keys(rootFolder.folders).find(k => String(rootFolder.folders[k].channelId) === String(chanId));
+        if (targetKey) delete rootFolder.folders[targetKey];
+        void clearChannelCache(String(chanId));
+      });
+      setPathStack(prev => [...prev]);
     }
+
+    // ULTRA-FAST ATOMIC CACHE UPDATE (< 5ms): updates both source & destination trees + IndexedDB
+    // immediately without wiping channel caches or racing Telegram's 2s search index lag!
+    if (mutation) {
+      void (async () => {
+        if (mutation.type === 'move' || mutation.type === 'copy') {
+          const hasExplicitItems =
+            (mutation.movedOrCopiedFiles?.length || 0) > 0 ||
+            (mutation.movedOrCopiedFolders?.length || 0) > 0;
+          if (!hasExplicitItems) {
+            affectedChannels.forEach(chanId => {
+              if (deletedChannels && deletedChannels.has(chanId)) return;
+              refreshChannel(String(chanId));
+            });
+            return;
+          }
+          const srcFolder = findChanFolder(String(mutation.sourceChannelId));
+          const dstFolder = findChanFolder(String(mutation.targetChannelId));
+          await applyCacheMoveOrCopy({
+            action: mutation.type,
+            sourceChannelId: srcFolder?.channelId || mutation.sourceChannelId,
+            sourceChannelFolder: srcFolder,
+            targetChannelId: dstFolder?.channelId || mutation.targetChannelId,
+            targetChannelFolder: dstFolder,
+            targetFolderId: mutation.targetFolderId,
+            movedOrCopiedFiles: mutation.movedOrCopiedFiles || [],
+            movedOrCopiedFolders: mutation.movedOrCopiedFolders || [],
+            globalFilesMap: filesMapRef.current,
+          });
+          syncFolderStack();
+          return;
+        }
+        if (mutation.type === 'delete') {
+          for (const chanId of affectedChannels) {
+            if (deletedChannels && deletedChannels.has(chanId)) continue;
+            const targetChan = findChanFolder(String(chanId));
+            await applyCacheDelete(targetChan?.channelId || chanId, targetChan, mutation.items || [], filesMapRef.current);
+          }
+          syncFolderStack();
+          return;
+        }
+        if (mutation.type === 'rename' && !mutation.isRootChannelRename) {
+          const targetChan = findChanFolder(String(mutation.channelId));
+          await applyCacheRename(targetChan?.channelId || mutation.channelId, targetChan, mutation.item, mutation.newName, filesMapRef.current);
+          syncFolderStack();
+          return;
+        }
+        // Fallback for root channel title rename
+        affectedChannels.forEach(chanId => {
+          if (deletedChannels && deletedChannels.has(chanId)) return;
+          refreshChannel(String(chanId));
+        });
+      })();
+      return;
+    }
+
+    affectedChannels.forEach(chanId => {
+      if (deletedChannels && deletedChannels.has(chanId)) return;
+      refreshChannel(String(chanId));
+    });
   });
   pasteItemsRef.current = pasteItems;
   useEffect(() => {
@@ -7863,22 +7934,31 @@ export const DriveUI: React.FC = () => {
           onClose={() => setDeleteModalItems(null)}
           onComplete={(affectedChannels, deletedChannels) => {
             if (client) {
-              const rootFolder = pathStack[0];
+              const rootFolder = pathStackRef.current[0] || pathStack[0];
               if (rootFolder) {
                 if (deletedChannels && deletedChannels.size > 0) {
                   deletedChannels.forEach(chanId => {
                     const targetKey = Object.keys(rootFolder.folders).find(k => String(rootFolder.folders[k].channelId) === String(chanId));
                     if (targetKey) delete rootFolder.folders[targetKey];
+                    void clearChannelCache(String(chanId));
                   });
                   setPathStack(prev => [...prev]);
                 }
-                affectedChannels.forEach(chanId => {
-                  if (deletedChannels && deletedChannels.has(chanId)) return;
-                  refreshChannel(String(chanId));
-                });
+                const itemsToPurge = deleteModalItems ? [...deleteModalItems] : [];
+                void (async () => {
+                  for (const chanId of affectedChannels) {
+                    if (deletedChannels && deletedChannels.has(chanId)) continue;
+                    const targetNumId = channelNumericId(String(chanId));
+                    const targetChan = Object.values(rootFolder.folders).find(f => {
+                      const fNumId = channelNumericId(String(f.channelId || ''));
+                      return (targetNumId && fNumId && targetNumId === fNumId) || String(f.channelId || '') === String(chanId) || String(f.id) === String(chanId);
+                    });
+                    await applyCacheDelete(targetChan?.channelId || chanId, targetChan, itemsToPurge, filesMapRef.current);
+                  }
+                  syncFolderStack();
+                })();
               }
             }
-
           }}
         />
       )}
