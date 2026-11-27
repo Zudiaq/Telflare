@@ -2514,7 +2514,8 @@ export const applyCacheRename = async (
   globalFilesMap?: { [path: string]: VirtualFile },
 ) => {
   const chanId = normChanId(channelId);
-  if (!chanId || chanId === 'root' || !newName.trim()) return;
+  const cleanName = newName.trim();
+  if (!chanId || chanId === 'root' || !cleanName) return;
 
   try {
     const cached = await loadChannelCache(chanId);
@@ -2522,14 +2523,19 @@ export const applyCacheRename = async (
       const file: VirtualFile = item.item;
       const oldId = file.id;
       const oldPath = file.path;
+      const msgIds = new Set((file.parts || []).map((p) => Number(p.messageId)));
       const dirPart = oldPath.includes('/') ? oldPath.slice(0, oldPath.lastIndexOf('/')) : '';
-      const nextPath = dirPart ? `${dirPart}/${newName}` : newName;
+      const nextPath = dirPart ? `${dirPart}/${cleanName}` : cleanName;
       const chanPrefix = channelFolder?.id || chanId;
       const nextId = `${chanPrefix}/${nextPath}`;
 
-      file.name = newName;
-      file.path = nextPath;
-      file.id = nextId;
+      const applyToFileObj = (f: VirtualFile) => {
+        f.name = cleanName;
+        f.path = nextPath;
+        f.id = nextId;
+      };
+
+      applyToFileObj(file);
       if (globalFilesMap) {
         delete globalFilesMap[oldId];
         delete globalFilesMap[oldPath];
@@ -2537,38 +2543,87 @@ export const applyCacheRename = async (
         globalFilesMap[nextPath] = file;
       }
 
+      // Also update matching file object inside in-memory tree (handles cloned references) & capture parent folderId
+      let resolvedBucketPId = file.pId && file.pId !== 'root' ? String(file.pId) : '';
+      if (channelFolder) {
+        const stack: VirtualFolder[] = [channelFolder];
+        while (stack.length > 0) {
+          const node = stack.pop()!;
+          for (const f of node.files || []) {
+            if (f.id === oldId || (f.parts || []).some((p) => msgIds.has(Number(p.messageId)))) {
+              applyToFileObj(f);
+              if (globalFilesMap) {
+                globalFilesMap[nextId] = f;
+                globalFilesMap[nextPath] = f;
+              }
+              if (!resolvedBucketPId && node.folderId) {
+                resolvedBucketPId = String(node.folderId);
+              }
+            }
+          }
+          for (const sub of Object.values(node.folders || {})) stack.push(sub);
+        }
+      }
+
       if (cached) {
         for (const f of cached.files || []) {
-          if (f.id === oldId || f.parts?.[0]?.messageId === file.parts?.[0]?.messageId) {
-            f.name = newName;
-            f.path = nextPath;
-            f.id = nextId;
+          if (f.id === oldId || (f.parts || []).some((p) => msgIds.has(Number(p.messageId)))) {
+            applyToFileObj(f);
           }
         }
         await saveChannelCache(chanId, cached);
       }
-      if (file.pId && file.pId !== 'root') {
-        const bucket = await loadFolderBucket(chanId, String(file.pId));
+
+      if (resolvedBucketPId && resolvedBucketPId !== 'root') {
+        const bucket = await loadFolderBucket(chanId, resolvedBucketPId);
         if (bucket) {
           for (const f of bucket.files) {
-            if (f.id === oldId || f.parts?.[0]?.messageId === file.parts?.[0]?.messageId) {
-              f.name = newName;
-              f.path = nextPath;
-              f.id = nextId;
+            if (f.id === oldId || (f.parts || []).some((p) => msgIds.has(Number(p.messageId)))) {
+              applyToFileObj(f);
             }
           }
-          await saveFolderBucket(chanId, String(file.pId), bucket.files, bucket.complete);
+          await saveFolderBucket(chanId, resolvedBucketPId, bucket.files, bucket.complete);
         }
       }
     } else if (item.type === 'folder') {
       const folder: VirtualFolder = item.item;
-      if (cached?.foldersList && folder.folderId) {
-        const entry = cached.foldersList.find((f) => String(f.id) === String(folder.folderId));
+      const targetFid = folder.folderId ? String(folder.folderId) : '';
+      if (cached?.foldersList && targetFid) {
+        const entry = cached.foldersList.find((f) => String(f.id) === targetFid);
         if (entry) {
-          entry.name = newName;
+          entry.name = cleanName;
           await saveChannelCache(chanId, cached);
           if (channelFolder) {
             hydrateChannelFromCache(channelFolder, cached, globalFilesMap);
+            // Re-sync file paths & globalFilesMap keys for the renamed folder (and its cached bucket)
+            const lookup = createFolderLookup(cached.foldersList);
+            const newDirPath = resolveFolderPathFast(targetFid, lookup) || cleanName;
+            const renamedNode = findSubfolderNodeById(channelFolder, targetFid);
+            if (renamedNode) {
+              for (const f of renamedNode.files || []) {
+                const oldFId = f.id;
+                const oldFPath = f.path;
+                const nextFPath = `${newDirPath}/${f.name}`;
+                const nextFId = `${channelFolder.id}/${nextFPath}`;
+                f.path = nextFPath;
+                f.id = nextFId;
+                if (globalFilesMap) {
+                  delete globalFilesMap[oldFId];
+                  delete globalFilesMap[oldFPath];
+                  globalFilesMap[nextFId] = f;
+                  globalFilesMap[nextFPath] = f;
+                }
+              }
+            }
+            const bucket = await loadFolderBucket(chanId, targetFid);
+            if (bucket && bucket.files.length > 0) {
+              for (const f of bucket.files) {
+                const nextFPath = `${newDirPath}/${f.name}`;
+                f.path = nextFPath;
+                f.id = `${channelFolder.id}/${nextFPath}`;
+              }
+              await saveFolderBucket(chanId, targetFid, bucket.files, bucket.complete);
+            }
           }
         }
       }

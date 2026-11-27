@@ -2847,13 +2847,16 @@ export const DriveUI: React.FC = () => {
       for (let i = 1; i < prevStack.length; i++) {
         const targetId = prevStack[i].id;
         const targetName = prevStack[i].name;
+        const targetFolderId = prevStack[i].folderId;
 
         if (targetId.startsWith('search:')) {
           newStack.push(prevStack[i]);
           break;
         }
 
-        let matched = Object.values(curr.folders).find(f => f.id === targetId || f.name === targetName);
+        let matched = Object.values(curr.folders).find(
+          f => (targetFolderId && f.folderId && String(f.folderId) === String(targetFolderId)) || f.id === targetId || f.name === targetName
+        );
 
         // If not found in curr.folders and curr is root, look inside hoisted root storage channel (Cloud Root)
         if (!matched && curr.id === 'root' && zudRootChannelId) {
@@ -3192,8 +3195,25 @@ export const DriveUI: React.FC = () => {
           syncFolderStack();
           return;
         }
-        if (mutation.type === 'rename' && !mutation.isRootChannelRename) {
+        if (mutation.type === 'rename') {
           const targetChan = findChanFolder(String(mutation.channelId));
+          if (mutation.isRootChannelRename) {
+            const cleanName = String(mutation.newName || '').trim();
+            if (targetChan && cleanName) {
+              targetChan.name = cleanName;
+            }
+            setAvailableChannels(prev => {
+              const next = prev.map(ch =>
+                String(ch.id) === String(mutation.channelId) || channelNumericId(String(ch.id)) === channelNumericId(String(mutation.channelId))
+                  ? { ...ch, name: cleanName || ch.name }
+                  : ch
+              );
+              try { localStorage.setItem(channelsStorageKey, JSON.stringify(next)); } catch {}
+              return next;
+            });
+            syncFolderStack();
+            return;
+          }
           await applyCacheRename(targetChan?.channelId || mutation.channelId, targetChan, mutation.item, mutation.newName, filesMapRef.current);
           syncFolderStack();
           return;
